@@ -17,6 +17,8 @@
 #include <thrust/binary_search.h>
 #include <thrust/find.h>
 #include <thrust/for_each.h>
+#include <thrust/merge.h>
+#include <thrust/remove.h>
 #include <thrust/functional.h>
 #include <thrust/host_vector.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -115,6 +117,9 @@ struct Spec {
   const Zw *target;                // start matrix (unitary: the target U; states: input rows), exponent tk
   int tk;
   const int *cxtable;
+  int nsym, nogoal;                // symmetry group size (1: off); nogoal: never report the goal (table build)
+  const uint8_t *symperm;          // nsym x N: basis-index map of each group element (a qubit relabelling)
+  const uint8_t *symconj;          // nsym: element also conjugates entries (T <-> Tdg, S <-> Sdg)
   int lite, tdiv;                  // gate set with ccx: only h = k and ceil(T bound / tdiv) are sound
   int states, m, gk;               // states: m pairs, rows of the residual are the images p|in_j> (transposed)
   const Zw *goal;                  // the search ends when the residual equals goal / sqrt2^gk (unitary: I)
@@ -214,6 +219,39 @@ template <int NQ> HD inline void hash2(const Mat<NQ> &S, uint64_t &h1, uint64_t 
   uint64_t a = 0, b = 0;
   for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) hash_entry(i, S.e[i], a, b);
   hash_final(S.k, a, b, h1, h2);
+}
+
+// Symmetry classes. Group element s maps S to S' with S'[pi(r)][pi(c)] = S[r][c] (qubit relabelling pi, as a
+// basis-index map), entries conjugated if symconj[s]. The remaining gate count is the same for every member of
+// a class when the candidates are closed under relabelling (and conjugation). The class key is the smallest
+// hash over the orbit; element 0 is the identity, so with nsym = 1 this is hash2.
+HD inline Zw32 zconj32(Zw32 x) { return {x.a, (StoreT)-x.d, (StoreT)-x.c, (StoreT)-x.b}; }
+HD inline bool hless(uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2) { return a1 != b1 ? a1 < b1 : a2 < b2; }
+template <int NQ> HD inline void class_hash(const Mat<NQ> &S, const Spec &sp, uint64_t &h1, uint64_t &h2) {
+  constexpr int N = 1 << NQ;
+  h1 = h2 = ~0ULL;
+  for (int s = 0; s < sp.nsym; s++) {
+    const uint8_t *pm = sp.symperm + s * N;
+    uint64_t a = 0, b = 0, x1, x2;
+    for (int e = 0; e < N * N; e++)
+      hash_entry(pm[e >> NQ] * N + pm[e & (N - 1)], sp.symconj[s] ? zconj32(S.e[e]) : S.e[e], a, b);
+    hash_final(S.k, a, b, x1, x2);
+    if (hless(x1, x2, h1, h2)) { h1 = x1; h2 = x2; }
+  }
+}
+template <int NQ> HD inline bool same_class(const Mat<NQ> &A, const Mat<NQ> &B, const Spec &sp) {
+  constexpr int N = 1 << NQ;
+  if (A.k != B.k) return false;
+  for (int s = 0; s < sp.nsym; s++) {
+    const uint8_t *pm = sp.symperm + s * N;
+    bool eq = true;
+    for (int e = 0; eq && e < N * N; e++) {
+      const Zw32 v = sp.symconj[s] ? zconj32(A.e[e]) : A.e[e];
+      eq = zeq32(v, B.e[pm[e >> NQ] * N + pm[e & (N - 1)]]);
+    }
+    if (eq) return true;
+  }
+  return false;
 }
 
 // ---------------- lower bounds (milq depth_bounds.lower_bound, strong, -v all) ----------------
@@ -603,6 +641,7 @@ struct KeyLessIdx {     // hash, then index (= lexicographic prefix order)
     return x.idx < y.idx;
   }
 };
+struct IsTrue { HD bool operator()(bool b) const { return b; } };
 struct KeyByIdx { HD bool operator()(const Key &x, const Key &y) const { return x.idx < y.idx; } };
 
 enum : uint8_t { DEAD = 0, ALIVE = 1, FOUND = 2, W2CUT = 3, W3CUT = 4, NEEDT = 5, OVF = 6 };
@@ -641,8 +680,8 @@ template <int NQ> struct Cheap {
     Mat<NQ> C = R[i];
     apply_inv(C, sp.gates[g]);
     if (C.ovf || R[i].ovf) { status[o] = OVF; return; }
-    if (is_goal(C, sp)) { status[o] = FOUND; return; }
-    if (!sp.standard && !sp.lite) { status[o] = ALIVE; hash2(C, h1[o], h2[o]); return; }
+    if (is_goal(C, sp)) { status[o] = sp.nogoal ? DEAD : FOUND; return; }
+    if (!sp.standard && !sp.lite) { status[o] = ALIVE; class_hash(C, sp, h1[o], h2[o]); return; }
     int h, supp = 0, c2 = 0;
     if (sp.lite) h = C.k;
     else
@@ -676,7 +715,7 @@ template <int NQ> struct Full {             // pass 2, on NEEDT children only: T
     const int T = sp.states ? state_t(C, sp) : (ptm_wht(C) + sp.tdiv - 1) / sp.tdiv;
     if (combine(h, T, c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
     status[o] = ALIVE;
-    hash2(C, h1[o], h2[o]);
+    class_hash(C, sp, h1[o], h2[o]);
   }
 };
 
@@ -935,7 +974,7 @@ level_warp(Spec sp, Hist H, int tp, uint32_t off, const Mat<NQ> *R, long nc, uin
       bool ovf;
       const int k = warp_child<NQ>(S, R[i], sp.gates[g], lane, ovf);
       if (ovf) s = OVF;
-      else if (warp_goal<NQ>(S, k, sp, lane)) s = FOUND;
+      else if (warp_goal<NQ>(S, k, sp, lane)) s = sp.nogoal ? DEAD : FOUND;
       else {
         bool alive = true;
         if constexpr (ST) {
@@ -960,11 +999,18 @@ level_warp(Spec sp, Hist H, int tp, uint32_t off, const Mat<NQ> *R, long nc, uin
             alive = combine(h, T, c2, supp) <= sp.depth - t;
           }
         }
-        if (alive) {
-          uint64_t a = 0, b = 0;
-          for (int e = lane; e < E; e += 32) hash_entry(e, S[e], a, b);
-          for (int m = 16; m; m >>= 1) { a += __shfl_xor_sync(FULL_MASK, a, m); b += __shfl_xor_sync(FULL_MASK, b, m); }
-          if (!lane) hash_final(k, a, b, h1[o], h2[o]);
+        if (alive) {                                 // class key: smallest hash over the symmetry orbit
+          uint64_t b1 = ~0ULL, b2 = ~0ULL;
+          for (int sy = 0; sy < sp.nsym; sy++) {
+            const uint8_t *pm = sp.symperm + sy * N;
+            const bool cj = sp.symconj[sy];
+            uint64_t a = 0, b = 0, x1, x2;
+            for (int e = lane; e < E; e += 32) hash_entry(pm[e >> NQ] * N + pm[e & (N - 1)], cj ? zconj32(S[e]) : S[e], a, b);
+            for (int m = 16; m; m >>= 1) { a += __shfl_xor_sync(FULL_MASK, a, m); b += __shfl_xor_sync(FULL_MASK, b, m); }
+            hash_final(k, a, b, x1, x2);
+            if (hless(x1, x2, b1, b2)) { b1 = x1; b2 = x2; }
+          }
+          if (!lane) { h1[o] = b1; h2[o] = b2; }
         }
         s = alive ? ALIVE : DEAD;
       }
@@ -1014,9 +1060,7 @@ template <int NQ> struct SameChild {   // exact: hashes equal and the residual m
     Mat<NQ> A, B;
     child(x.idx, A);
     child(y.idx, B);
-    if (A.k != B.k) return false;
-    for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) if (!zeq32(A.e[i], B.e[i])) return false;
-    return true;
+    return same_class(A, B, sp);
   }
 };
 
@@ -1030,11 +1074,50 @@ struct Gather {          // kept keys -> the new level's parent / gate arrays an
   HD void operator()(int j) const { const uint32_t i = K[j].idx; P[j] = CP[i]; Gt[j] = CG[i]; F1[j] = K[j].h1; F2[j] = K[j].h2; }
 };
 
+struct DKey { uint64_t h1, h2; uint32_t idx, lvl; };
+struct DKeyLess { HD bool operator()(const DKey &x, const DKey &y) const { return hless(x.h1, x.h2, y.h1, y.h2); } };
+HD inline long dkey_lower(const DKey *K, long n, uint64_t h1, uint64_t h2) {   // first entry with hash >= (h1, h2)
+  long lo = 0, hi = n;
+  while (lo < hi) { const long mid = (lo + hi) / 2; if (hless(K[mid].h1, K[mid].h2, h1, h2)) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+template <int NQ> struct SeenBefore {    // child's class already at a lower level (hash match, then exact)
+  Spec sp;
+  Hist H;
+  int tp;
+  const uint32_t *CP;
+  const uint8_t *CG;
+  const DKey *seen;
+  long ns;
+  HD bool operator()(const Key &x) const {
+    long i = dkey_lower(seen, ns, x.h1, x.h2);
+    if (i >= ns || seen[i].h1 != x.h1 || seen[i].h2 != x.h2) return false;
+    Mat<NQ> A, B;
+    uint8_t seq[DMAX];
+    int len = path(H, tp, CP[x.idx], seq);
+    seq[len] = CG[x.idx];
+    residual(A, sp, seq, len + 1);
+    for (; i < ns && seen[i].h1 == x.h1 && seen[i].h2 == x.h2; i++) {
+      len = path(H, seen[i].lvl, seen[i].idx, seq);
+      residual(B, sp, seq, len);
+      if (same_class(A, B, sp)) return true;
+    }
+    return false;
+  }
+};
+struct ToDKey {
+  const uint64_t *F1, *F2;
+  uint32_t lvl;
+  HD DKey operator()(int j) const { return {F1[j], F2[j], (uint32_t)j, lvl}; }
+};
+
 struct Tree {            // host handle of the search tree; level 0 is the empty prefix
   std::vector<thrust::device_vector<uint32_t>> P;
   std::vector<thrust::device_vector<uint8_t>> Gt;
   std::vector<long> n;
   thrust::device_vector<uint64_t> F1, F2;   // hashes of the top level's residuals
+  bool filter = false;                      // distance table: drop classes already seen at a lower level
+  thrust::device_vector<DKey> seen;         // every kept class so far, sorted by hash
   Tree() : P(1), Gt(1), n(1, 1) {}
   int top() const { return (int)n.size() - 1; }
   Hist hist() const {
@@ -1258,6 +1341,16 @@ template <int NQ> static int levels(const HostSpec &hs, const Spec &sp, int dept
       thrust::sort(CK.begin(), CK.end(), KeyByIdx{});
       distinct = (long)CK.size();
     }
+    if (T.filter && distinct) {
+      Pass p_(4);
+      thrust::device_vector<bool> old(distinct);
+      thrust::transform(CK.begin(), CK.end(), old.begin(),
+                        SeenBefore<NQ>{sp, H, tp, thrust::raw_pointer_cast(CP.data()), thrust::raw_pointer_cast(CG.data()),
+                                       thrust::raw_pointer_cast(T.seen.data()), (long)T.seen.size()});
+      auto end = thrust::remove_if(CK.begin(), CK.end(), old.begin(), IsTrue{});
+      CK.erase(end, CK.end());
+      distinct = (long)CK.size();
+    }
     std::printf("{%s\"t\": %d, \"parents\": %ld, \"prefixes\": %ld, \"cut_w3\": %ld, \"cut_lb\": %ld, \"survivors\": %ld, "
                 "\"distinct\": %ld, \"proved_unsat\": %s, \"seconds\": %.2f}\n",
                 tag, t, m, m * hs.G - n_w2, n_w3, n_dead, n_alive, distinct, distinct ? "false" : "true", now() - t0);
@@ -1271,8 +1364,232 @@ template <int NQ> static int levels(const HostSpec &hs, const Spec &sp, int dept
                             thrust::raw_pointer_cast(CG.data()), thrust::raw_pointer_cast(T.P.back().data()),
                             thrust::raw_pointer_cast(T.Gt.back().data()), thrust::raw_pointer_cast(T.F1.data()),
                             thrust::raw_pointer_cast(T.F2.data())});
+    if (T.filter) {
+      thrust::device_vector<DKey> nk(distinct), merged(T.seen.size() + distinct);
+      thrust::transform(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)distinct), nk.begin(),
+                        ToDKey{thrust::raw_pointer_cast(T.F1.data()), thrust::raw_pointer_cast(T.F2.data()), (uint32_t)t});
+      thrust::sort(nk.begin(), nk.end(), DKeyLess{});
+      thrust::merge(T.seen.begin(), T.seen.end(), nk.begin(), nk.end(), merged.begin(), DKeyLess{});
+      T.seen.swap(merged);
+    }
   }
   return 2;
+}
+
+// ---------------- symmetry group (host) ----------------
+// Candidate names are L_<gate>_<q>[_<q>...]. An element: qubit relabelling perm (qubit i -> perm[i]) and an
+// optional conjugation (t <-> tdg, s <-> sdg; x, z, h, cx, cz, ccx real). It is used only if it maps every
+// candidate to a candidate, so every member of a class has the same remaining gate count.
+static int sym_gate(const HostSpec &hs, const std::vector<int> &perm, bool conj, int g) {
+  const std::string &nm = hs.names[g];
+  std::vector<std::string> parts;
+  size_t a = 0, b;
+  while ((b = nm.find('_', a)) != std::string::npos) { parts.push_back(nm.substr(a, b - a)); a = b + 1; }
+  parts.push_back(nm.substr(a));
+  std::string gate = parts[1];
+  if (conj) {
+    if (gate == "t") gate = "tdg"; else if (gate == "tdg") gate = "t";
+    else if (gate == "s") gate = "sdg"; else if (gate == "sdg") gate = "s";
+    else if (gate != "x" && gate != "z" && gate != "h" && gate != "cx" && gate != "cz" && gate != "ccx") return -1;
+  }
+  std::vector<int> qs;
+  for (size_t i = 2; i < parts.size(); i++) qs.push_back(perm[std::atoi(parts[i].c_str())]);
+  if (gate == "ccx" && qs.size() == 3 && qs[0] > qs[1]) std::swap(qs[0], qs[1]);   // controls unordered
+  std::string want = "L_" + gate;
+  for (int q : qs) want += "_" + std::to_string(q);
+  for (int h = 0; h < hs.G; h++) if (hs.names[h] == want) return h;
+  return -1;
+}
+struct SymGroup {
+  std::vector<std::vector<int>> perm;    // per element: qubit map
+  std::vector<uint8_t> conj, bperm;      // bperm: nsym x N basis-index maps
+  std::vector<std::vector<int>> gmap;    // per element: candidate -> candidate
+};
+static SymGroup sym_group(const HostSpec &hs, bool on) {
+  const int n = hs.n, N = 1 << n;
+  SymGroup g;
+  std::vector<int> p(n);
+  for (int i = 0; i < n; i++) p[i] = i;
+  std::vector<std::vector<int>> perms;
+  do perms.push_back(p); while (on && std::next_permutation(p.begin(), p.end()));
+  for (int cj = 0; cj < (on ? 2 : 1); cj++)
+    for (auto &pm : perms) {
+      std::vector<int> gm(hs.G);
+      bool ok = true;
+      for (int c = 0; c < hs.G && ok; c++) ok = (gm[c] = sym_gate(hs, pm, cj, c)) >= 0;
+      if (!ok) continue;
+      g.perm.push_back(pm); g.conj.push_back((uint8_t)cj); g.gmap.push_back(gm);
+      for (int x = 0; x < N; x++) {
+        int y = 0;
+        for (int i = 0; i < n; i++) if ((x >> i) & 1) y |= 1 << pm[i];
+        g.bperm.push_back((uint8_t)y);
+      }
+    }
+  return g;
+}
+
+// ---------------- distance table for the last k gates ----------------
+// Every symmetry class of unitaries with at most k gates, with its exact gate count: a search from the
+// identity without bounds (residual p^-1 of sequence p) that drops classes already seen at a lower level, so a
+// class sits at the level of its gate count. Built once per candidate list, k and group, cached on disk. In
+// the search, a residual whose class is in the table has exactly that remaining gate count, and one that is not
+// needs more than k gates - so the search stops at level D - k.
+static uint64_t fnv(uint64_t h, const void *p, size_t n) {
+  const unsigned char *c = (const unsigned char *)p;
+  for (size_t i = 0; i < n; i++) { h ^= c[i]; h *= 0x100000001b3ULL; }
+  return h;
+}
+static std::string table_path(const HostSpec &hs, const SymGroup &grp, int k) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (auto &nm : hs.names) h = fnv(h, nm.data(), nm.size() + 1);
+  h = fnv(h, &hs.n, sizeof hs.n); h = fnv(h, &k, sizeof k);
+  h = fnv(h, grp.bperm.data(), grp.bperm.size()); h = fnv(h, grp.conj.data(), grp.conj.size());
+  h = fnv(h, hs.bad2.data(), hs.bad2.size()); h = fnv(h, hs.bad3.data(), hs.bad3.size() * 4);
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "build/table-n%d-k%d-%016llx.bin", hs.n, k, (unsigned long long)h);
+  return buf;
+}
+static bool table_load(const std::string &path, Tree &D) {
+  FILE *f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  int nl = 0;
+  bool ok = std::fread(&nl, sizeof nl, 1, f) == 1 && nl >= 0 && nl <= DMAX;
+  for (int l = 1; ok && l <= nl; l++) {
+    long n = 0;
+    ok = std::fread(&n, sizeof n, 1, f) == 1 && n > 0;
+    if (!ok) break;
+    std::vector<uint32_t> P(n); std::vector<uint8_t> G(n);
+    ok = std::fread(P.data(), 4, n, f) == (size_t)n && std::fread(G.data(), 1, n, f) == (size_t)n;
+    D.P.emplace_back(P.begin(), P.end()); D.Gt.emplace_back(G.begin(), G.end()); D.n.push_back(n);
+  }
+  long ns = 0;
+  ok = ok && std::fread(&ns, sizeof ns, 1, f) == 1 && ns > 0;
+  if (ok) {
+    std::vector<DKey> K(ns);
+    ok = std::fread(K.data(), sizeof(DKey), ns, f) == (size_t)ns;
+    D.seen.assign(K.begin(), K.end());
+  }
+  std::fclose(f);
+  return ok;
+}
+static void table_save(const std::string &path, const Tree &D) {
+  FILE *f = std::fopen(path.c_str(), "wb");
+  if (!f) { std::fprintf(stderr, "cannot write %s (table not cached)\n", path.c_str()); return; }
+  const int nl = D.top();
+  std::fwrite(&nl, sizeof nl, 1, f);
+  for (int l = 1; l <= nl; l++) {
+    const long n = D.n[l];
+    thrust::host_vector<uint32_t> P(D.P[l]); thrust::host_vector<uint8_t> G(D.Gt[l]);
+    std::fwrite(&n, sizeof n, 1, f); std::fwrite(P.data(), 4, n, f); std::fwrite(G.data(), 1, n, f);
+  }
+  thrust::host_vector<DKey> K(D.seen);
+  const long ns = (long)K.size();
+  std::fwrite(&ns, sizeof ns, 1, f); std::fwrite(K.data(), sizeof(DKey), ns, f);
+  std::fclose(f);
+}
+
+template <int NQ> static int table_get(const HostSpec &hs, const Spec &sp, const SymGroup &grp, int k, long chunk,
+                                       const thrust::device_vector<Zw> &d_I, Tree &D) {
+  constexpr int N = 1 << NQ;
+  const std::string path = table_path(hs, grp, k);
+  const double t0 = now();
+  if (table_load(path, D)) {
+    std::fprintf(stderr, "table %s: %ld classes (loaded, %.1f s)\n", path.c_str(), (long)D.seen.size(), now() - t0);
+    return 0;
+  }
+  Spec sd = sp;                                  // from the identity, no bounds, never "found"
+  sd.target = thrust::raw_pointer_cast(d_I.data()); sd.tk = 0;
+  sd.standard = 0; sd.lite = 0; sd.states = 0; sd.nogoal = 1;
+  Spec hsd = sd;                                 // the identity's class key, on the host
+  std::vector<Zw> I(N * N, Zw{0, 0, 0, 0});
+  for (int i = 0; i < N; i++) I[i * N + i] = Zw{1, 0, 0, 0};
+  hsd.symperm = grp.bperm.data(); hsd.symconj = grp.conj.data();
+  Mat<NQ> M; M.ovf = 0; M.k = 0;
+  for (int i = 0; i < N * N; i++) M.e[i] = st(I[i], M.ovf);
+  DKey root{0, 0, 0, 0};
+  class_hash(M, hsd, root.h1, root.h2);
+  D.filter = true;
+  D.seen.assign(1, root);
+  std::vector<int> found;
+  long nf = 0;
+  const int rc = levels<NQ>(hs, sd, k + 1, k, true, chunk, D, found, nf, "\"dir\": \"table\", ");
+  if (rc == 4) return 4;
+  std::fprintf(stderr, "table: %ld classes within %d gates (%.1f s), cached in %s\n", (long)D.seen.size(), D.top(),
+               now() - t0, path.c_str());
+  table_save(path, D);
+  return 0;
+}
+
+struct NonNeg { HD bool operator()(long x) const { return x >= 0; } };
+struct InTable {          // node j of the top level: index into the table keys of its class, or -1
+  const uint64_t *F1, *F2;
+  const DKey *K;
+  long nk;
+  int maxc;
+  HD long operator()(int j) const {
+    const long i = dkey_lower(K, nk, F1[j], F2[j]);
+    for (long x = i; x < nk && K[x].h1 == F1[j] && K[x].h2 == F2[j]; x++) if ((int)K[x].lvl <= maxc) return x;
+    return -1;
+  }
+};
+
+// a circuit from the table: prefix (level t of T, or the target itself) + continuation for its residual S;
+// candidates confirmed exactly (class member, then the whole circuit == U). Returns the shortest, or empty.
+template <int NQ> static std::vector<int> table_hit(const HostSpec &hs, const Spec &hsp, const SymGroup &grp,
+                                                    const std::vector<int> &inv, const Tree &T, int t, const Tree &D,
+                                                    int maxc) {
+  constexpr int N = 1 << NQ;
+  thrust::host_vector<DKey> keys;               // lazily: only when a hash matched
+  const long nt = T.n[t];
+  std::vector<std::pair<int, long>> cand;        // (cost, node j)
+  thrust::device_vector<long> pos(nt);
+  thrust::transform(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)nt), pos.begin(),
+                    InTable{thrust::raw_pointer_cast(T.F1.data()), thrust::raw_pointer_cast(T.F2.data()),
+                            thrust::raw_pointer_cast(D.seen.data()), (long)D.seen.size(), maxc});
+  const long nh = (long)thrust::count_if(pos.begin(), pos.end(), NonNeg{});
+  if (!nh) return {};
+  thrust::host_vector<long> hp(pos);
+  keys = D.seen;
+  for (long j = 0; j < nt; j++) if (hp[j] >= 0) cand.push_back({(int)keys[hp[j]].lvl, j});
+  std::sort(cand.begin(), cand.end());
+  Spec hI = hsp;
+  std::vector<Zw> I(N * N, Zw{0, 0, 0, 0});
+  for (int i = 0; i < N; i++) I[i * N + i] = Zw{1, 0, 0, 0};
+  hI.target = I.data(); hI.tk = 0;
+  for (auto &c : cand) {
+    const std::vector<int> pre = T.seq(t, (uint32_t)c.second);
+    std::vector<uint8_t> p8(pre.begin(), pre.end());
+    Mat<NQ> S;
+    residual(S, hsp, p8.data(), (int)p8.size());
+    const DKey &k0 = keys[hp[c.second]];
+    for (long x = hp[c.second]; x < (long)keys.size() && keys[x].h1 == k0.h1 && keys[x].h2 == k0.h2; x++) {
+      if ((int)keys[x].lvl > maxc) continue;
+      const std::vector<int> w = D.seq(keys[x].lvl, keys[x].idx);   // table sequence: its residual E = W^-1
+      std::vector<uint8_t> w8(w.begin(), w.end());
+      Mat<NQ> E;
+      residual(E, hI, w8.data(), (int)w8.size());
+      for (size_t sy = 0; sy < grp.conj.size(); sy++) {             // sigma(E) == S ?
+        const uint8_t *pm = grp.bperm.data() + sy * N;
+        bool eq = E.k == S.k;
+        for (int e = 0; eq && e < N * N; e++)
+          eq = zeq32(grp.conj[sy] ? zconj32(E.e[e]) : E.e[e], S.e[pm[e >> NQ] * N + pm[e & (N - 1)]]);
+        if (!eq) continue;
+        std::vector<int> full = pre;                                 // sequence with product E: w reversed, inverted
+        for (int i = (int)w.size() - 1; i >= 0; i--) full.push_back(grp.gmap[sy][inv[w[i]]]);
+        std::vector<uint8_t> f8(full.begin(), full.end());
+        Mat<NQ> Z;
+        residual(Z, hsp, f8.data(), (int)f8.size());
+        bool ok = Z.k == 0;
+        for (int r = 0; ok && r < N; r++)
+          for (int cc = 0; ok && cc < N; cc++) {
+            const Zw32 v = Z.e[r * N + cc];
+            ok = r == cc ? (v.a == 1 && !v.b && !v.c && !v.d) : zzero32(v);
+          }
+        if (ok) return full;
+      }
+    }
+  }
+  return {};
 }
 
 // ---------------- meet in the middle ----------------
@@ -1282,7 +1599,6 @@ template <int NQ> static int levels(const HostSpec &hs, const Spec &sp, int dept
 // Circuits shorter than a are found by the forward levels themselves. Every circuit of <= D gates has a
 // canonical prefix and suffix in the two trees (windows, bounds and dedupe are sound on both sides), so no match
 // is a proof. The backward tree itself is the backward table.
-struct IsTrue { HD bool operator()(bool b) const { return b; } };
 struct FwdKey {
   const uint64_t *F1, *F2;
   HD Key operator()(int i) const { return {F1[i], F2[i], (uint32_t)i}; }
@@ -1443,7 +1759,7 @@ template <int NQ> static int mitm_join(const HostSpec &hs, const Spec &sp, int d
   return 1;
 }
 
-template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, long chunk, int mitm) {
+template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, long chunk, int mitm, bool sym, int tk) {
   thrust::device_vector<Gate> d_gates(hs.gates.begin(), hs.gates.end());
   thrust::device_vector<uint8_t> d_bad2(hs.bad2.begin(), hs.bad2.end());
   thrust::device_vector<uint32_t> d_bad3(hs.bad3.begin(), hs.bad3.end());
@@ -1467,6 +1783,13 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
   sp.states = hs.states; sp.m = hs.states ? hs.m : (1 << hs.n); sp.gk = hs.gk;
   sp.goal = thrust::raw_pointer_cast(d_goal.data());
   sp.ginfo = thrust::raw_pointer_cast(d_ginfo.data());
+  // symmetry classes: plain unitary search only (the meet-in-the-middle join needs exact residuals)
+  const SymGroup grp = sym_group(hs, sym && !mitm && !hs.states);
+  thrust::device_vector<uint8_t> d_symperm(grp.bperm.begin(), grp.bperm.end()), d_symconj(grp.conj.begin(), grp.conj.end());
+  sp.nsym = (int)grp.conj.size(); sp.nogoal = 0;
+  sp.symperm = thrust::raw_pointer_cast(d_symperm.data());
+  sp.symconj = thrust::raw_pointer_cast(d_symconj.data());
+  std::fprintf(stderr, "symmetry classes: %d group elements\n", sp.nsym);
 
   {   // depth 0: is the target the identity?
     Mat<NQ> S; S.ovf = 0; S.k = hs.tk;
@@ -1478,6 +1801,45 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
   }
   const double t0 = now();
   if (mitm) return mitm_join<NQ>(hs, sp, depth, dedupe, chunk, d_target, t0);
+  if (tk > 0 && !hs.states) {
+    constexpr int N = 1 << NQ;
+    std::vector<Zw> I(N * N, Zw{0, 0, 0, 0});
+    for (int i = 0; i < N; i++) I[i * N + i] = Zw{1, 0, 0, 0};
+    thrust::device_vector<Zw> d_I(I.begin(), I.end());
+    Tree D;
+    if (table_get<NQ>(hs, sp, grp, tk, chunk, d_I, D) == 4) return 4;
+    const std::vector<int> inv = inverse_gates(hs);
+    Spec hsp = sp;                               // host copy for exact checks
+    hsp.gates = hs.gates.data(); hsp.target = hs.target.data();
+    hsp.symperm = grp.bperm.data(); hsp.symconj = grp.conj.data();
+    Tree T;
+    {   // level 0: the target's own class
+      Mat<NQ> U; U.ovf = 0; U.k = hs.tk;
+      for (int i = 0; i < N * N; i++) U.e[i] = st(hs.target[i], U.ovf);
+      uint64_t a, b;
+      class_hash(U, hsp, a, b);
+      T.F1.assign(1, a); T.F2.assign(1, b);
+    }
+    std::vector<int> found;
+    long n_found = 0;
+    for (int t = 0; t <= depth - tk || t == 0; t++) {
+      if (t > 0) {
+        const int rc = levels<NQ>(hs, sp, depth, t, dedupe, chunk, T, found, n_found, "");
+        if (rc == 0) { print_circuit(hs, found, n_found, "", t0); return 0; }
+        if (rc != 2) return rc;
+      }
+      const std::vector<int> hit = table_hit<NQ>(hs, hsp, grp, inv, T, t, D, depth - t);
+      if (!hit.empty()) {
+        char extra[64];
+        std::snprintf(extra, sizeof extra, ", \"table\": [%d, %d]", t, (int)hit.size() - t);
+        print_circuit(hs, hit, 1, extra, t0);
+        return 0;
+      }
+    }
+    // the last level searched was D - k: there every residual outside the table needs more than k gates
+    std::printf("{\"depth\": %d, \"proved_unsat\": true, \"table\": %d}\n", depth, tk);
+    return 1;
+  }
   Tree T;
   std::vector<int> found;
   long n_found = 0;
@@ -1488,19 +1850,21 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: cudasynth SPEC [--depth D] [--no-dedupe] [--chunk PARENTS] [--mitm] [--profile]\n"
+    std::fprintf(stderr, "usage: cudasynth SPEC [--depth D] [--no-dedupe] [--chunk PARENTS] [--mitm] [--no-sym] [--table K] [--profile]\n"
                          "exit 0: circuit found, 1: no circuit of <= depth gates (proof)\n");
     return 3;
   }
   std::ifstream f(argv[1]);
   HostSpec hs = read_spec(f);
-  int depth = hs.depth, mitm = 0; bool dedupe = true; long chunk = 1 << 17;
+  int depth = hs.depth, mitm = 0, tablek = 0; bool dedupe = true, sym = true; long chunk = 1 << 17;
   for (int i = 2; i < argc; i++) {
     if (!std::strcmp(argv[i], "--depth") && i + 1 < argc) depth = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-dedupe")) dedupe = false;
     else if (!std::strcmp(argv[i], "--chunk") && i + 1 < argc) chunk = std::atol(argv[++i]);
     else if (!std::strcmp(argv[i], "--profile")) g_prof = true;
     else if (!std::strcmp(argv[i], "--mitm")) mitm = 1;
+    else if (!std::strcmp(argv[i], "--no-sym")) sym = false;
+    else if (!std::strcmp(argv[i], "--table") && i + 1 < argc) tablek = std::atoi(argv[++i]);
   }
   if (depth > DMAX) { std::fprintf(stderr, "depth > %d\n", DMAX); return 3; }
   std::fprintf(stderr, "cudasynth: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
@@ -1513,16 +1877,16 @@ int main(int argc, char **argv) {
   int rc = 3;
   switch (hs.n) {   // qubit counts compiled in: NQ_MIN..NQ_MAX (each one is a full instantiation; nvcc is slow)
 #if NQ_MIN <= 1 && NQ_MAX >= 1
-    case 1: rc = run<1>(hs, depth, dedupe, chunk, mitm); break;
+    case 1: rc = run<1>(hs, depth, dedupe, chunk, mitm, sym, tablek); break;
 #endif
 #if NQ_MIN <= 2 && NQ_MAX >= 2
-    case 2: rc = run<2>(hs, depth, dedupe, chunk, mitm); break;
+    case 2: rc = run<2>(hs, depth, dedupe, chunk, mitm, sym, tablek); break;
 #endif
 #if NQ_MIN <= 3 && NQ_MAX >= 3
-    case 3: rc = run<3>(hs, depth, dedupe, chunk, mitm); break;
+    case 3: rc = run<3>(hs, depth, dedupe, chunk, mitm, sym, tablek); break;
 #endif
 #if NQ_MIN <= 4 && NQ_MAX >= 4
-    case 4: rc = run<4>(hs, depth, dedupe, chunk, mitm); break;
+    case 4: rc = run<4>(hs, depth, dedupe, chunk, mitm, sym, tablek); break;
 #endif
     default: std::fprintf(stderr, "n = %d not built (NQ_MIN..NQ_MAX)\n", hs.n); return 3;
   }

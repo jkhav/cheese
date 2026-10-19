@@ -3,7 +3,7 @@
 Exact arithmetic throughout: an entry of Z[w] (w = e^{i pi/4}) is (a, b, c, d) = a + b w + c w^2 + d w^3, a
 matrix is (k, entries) meaning entries / sqrt2^k, normalised (k as small as possible), so equal matrices have
 equal representations. Gate table, candidate order and the W2/W3 window rules follow milq
-(misc/perf/bvarr.py, misc/prototypes/fastsynth.py sym_rules), so results compare one to one with
+(its exact gate table and window rules), so results compare one to one with
 milq's prune_probe.py.
 
   python -m cudasynth.spec TARGET.qasm DEPTH > target.spec

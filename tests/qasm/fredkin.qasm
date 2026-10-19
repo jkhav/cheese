@@ -1,5 +1,5 @@
 // fredkin: CX Toffoli CX
-// hand-written for misc/BENCHMARK_EXPANSION.md §3.2
+// hand-written benchmark
 OPENQASM 2.0;
 include "qelib1.inc";
 qreg q[3];

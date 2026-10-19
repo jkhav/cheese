@@ -1,5 +1,5 @@
 // peres: Toffoli then CX (AMMR 2013: T-count 7)
-// hand-written for misc/BENCHMARK_EXPANSION.md §3.2
+// hand-written benchmark
 OPENQASM 2.0;
 include "qelib1.inc";
 qreg q[3];

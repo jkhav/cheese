@@ -1,7 +1,6 @@
 # cudasynth: GPU branch-and-bound synthesis, plan
 
-Copied from milq `misc/GPU_SEARCH_PLAN.md` (2026-10-19). Paths below starting with `misc/` refer to the milq
-repository. The CPU prototype there, `misc/prototypes/prune_probe.py` (Python, 10 processes), proves depths no
+Started from milq's GPU search plan (2026-10-19). milq's CPU prototype (`prune_probe.py`, Python, 10 processes) proves depths no
 SAT run reached (Toffoli 9, CCZ 8, half_adder_3 9, Fredkin 9; 30-180 s each) and finds optimal circuits (CS = 5).
 This repository moves it to GPUs (an RTX card first, a university cluster later) and extends it to RUS targets.
 
@@ -78,6 +77,19 @@ table), join on hash(U p^-1) = hash(U R'), candidates confirmed exactly; complet
 verdicts as the plain search everywhere tested. Faster when the expensive levels lie past the middle (RUS 14
 budget 12: 20 s -> 10 s, RUS 27 budget 14: 71 s -> 63 s); slower when they sit in the middle (RUS 13 budget 16:
 214 s plain, 311 s mitm, peak 6 GB - both halves pay the 124M/227M-prefix levels 7-8).
+
+Symmetry classes and distance table (2026-10-20; details and soundness in docs/ALGORITHM.md sections 5.1, 6):
+- Dedupe by class under qubit relabelling and complex conjugation (up to 12 elements at 3 qubits), lexicographically
+  smallest prefix per class. Same verdicts and optimal lengths as exact dedupe everywhere tested. Toffoli 11
+  1.4 s -> 0.5 s (largest frontier 172,054 -> 49,503); CCZ 8 frontier 4,960 -> 501; RUS 27 budget 14 64 s ->
+  34 s; no gain for asymmetric targets (RUS 14).
+- `--table K`: every class of <= K gates with its exact gate count (BFS from the identity, cross-level class
+  filter, cached in build/). The search stops at level D - K. Clifford+T, 3 qubits: K=7 2.65M classes (3.6 s to
+  build), K=8 17.9M (30 s); with ccx, K=7 15.9M.
+- RUS 27 budget 14: 64-95 s plain, 34 s classes, 12.2 s K=7, 2.8 s K=8 (table cached).
+  RUS 13 budget 16: 214 s plain, 75 s K=7.
+- Fredkin (17-gate Clifford+T input) with `--table 8`: budgets 1..15 proved impossible (previous best proof:
+  9); budget 15 took 10.8 s of search (largest frontier 6.6M). Budget 16 and Toffoli (15-gate input): running.
 
 Not implemented yet (in order):
 1. ~~GPU memory layout~~ (done, above).
