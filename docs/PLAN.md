@@ -56,6 +56,19 @@ test and bench instance):
 - Toffoli 10 5.2 s -> 0.54 s, Toffoli 11 30.5 s -> 1.25 s, Toffoli 12 impossible in 7.9 s (new). Remaining
   time at Toffoli 12: kernel 4.7 s, dedupe 1.6 s, parent residuals 0.9 s (`--profile`).
 
+RUS benchmarks (rus-synth/benchmarks/rus, spec.qasm as a full unitary, measurement dropped; optimum with every
+smaller budget proven impossible, verified exactly; GPU, seconds each): test 4, RUS 1 11, 2 7, 3 11, 4 18, 5 29,
+6 28, 7 7 (RUS 7 uses ccx).
+
+Gate sets with ccx (`lite` in the spec): only the H bound (k; ccx is a permutation) and ceil(T bound / tdiv)
+(tdiv = largest PTM sde of one gate: T 1, ccx 2) are sound; CX, support and structure bounds are off. Checked
+against bound-free runs (RUS 7, budgets 3-6). A frontier left after the last level is a proof (exit 1, no
+longer "open"), and last-level survivors are not stored.
+
+State targets (item 2, partial): `spec.py --ancilla Q.. | --inputs X,..` writes C|in_j> = Ref|in_j> specs; exact
+per-pair bounds (sde, stabilizer nullity, Schmidt ranks by exact minors). CPU build only for now - the GPU
+kernel aborts on some inputs.
+
 Not implemented yet (in order):
 1. ~~GPU memory layout~~ (done, above).
 2. RUS / state targets: vector pairs instead of a full unitary, per-pair state bounds (section 5).

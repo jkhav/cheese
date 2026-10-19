@@ -109,9 +109,13 @@ struct Spec {
   const Gate *gates;
   const uint8_t *bad2;             // G x G
   const uint32_t *bad3;            // bitset G^3
-  const Zw *target;                // N x N, exponent tk
+  const Zw *target;                // start matrix (unitary: the target U; states: input rows), exponent tk
   int tk;
   const int *cxtable;
+  int lite, tdiv;                  // gate set with ccx: only h = k and ceil(T bound / tdiv) are sound
+  int states, m, gk;               // states: m pairs, rows of the residual are the images p|in_j> (transposed)
+  const Zw *goal;                  // the search ends when the residual equals goal / sqrt2^gk (unitary: I)
+  const int *ginfo;                // states: per pair sde, nullity, Schmidt rank per cut of the goal row
 };
 
 // ---------------- exact matrices ----------------
@@ -177,6 +181,16 @@ template <int NQ> HD inline bool is_identity(const Mat<NQ> &S) {
       const Zw32 x = S.e[r * N + c];
       if (r == c ? !(x.a == 1 && !x.b && !x.c && !x.d) : !zzero32(x)) return false;
     }
+  return true;
+}
+
+template <int NQ> HD inline bool is_goal(const Mat<NQ> &S, const Spec &sp) {
+  if (S.k != sp.gk) return false;
+  for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) {
+    const Zw g = sp.goal[i];
+    const Zw32 x = S.e[i];
+    if (x.a != g.a || x.b != g.b || x.c != g.c || x.d != g.d) return false;
+  }
   return true;
 }
 
@@ -393,6 +407,140 @@ template <int NQ> HD inline int ptm_wht(const Mat<NQ> &S) {
   return 2 * (NQ + S.k) <= 64 ? ptm_wht_t<NQ, uint32_t>(S) : ptm_wht_t<NQ, uint64_t>(S);
 }
 
+// ---------------- state bounds (rows j < m are the images of the inputs, goal rows fixed) ----------------
+// H: sde changes by <= 1 per H. T: stabilizer nullity changes by <= 1 per T (Cliffords keep it). CX: the
+// Schmidt rank across a cut changes by a factor <= 2 per crossing CX/CZ. Ranks are exact (minors in int64
+// under a coefficient bound; mod-p ranks could be too low and overstate the gap to a higher goal rank).
+HD inline int64_t zbig(Zw32 x) {
+  int64_t m = 0, v;
+  v = x.a < 0 ? -(int64_t)x.a : x.a; if (v > m) m = v;
+  v = x.b < 0 ? -(int64_t)x.b : x.b; if (v > m) m = v;
+  v = x.c < 0 ? -(int64_t)x.c : x.c; if (v > m) m = v;
+  v = x.d < 0 ? -(int64_t)x.d : x.d; if (v > m) m = v;
+  return m;
+}
+HD inline int row_sde(const Zw32 *row, int N, int k) {
+  int v = 1 << 30;
+  for (int x = 0; x < N; x++) if (!zzero32(row[x])) { const int z = zval(ld(row[x])); if (z < v) v = z; }
+  return v == (1 << 30) || k - v < 0 ? 0 : k - v;
+}
+HD inline Zw zneg(Zw x) { return {-x.a, -x.b, -x.c, -x.d}; }
+HD inline bool pauli_stab(const Zw32 *row, int nq, int b, Zw nrm) {   // P_b |v> = +-|v>  <=>  <v|P_b|v> = +-<v|v>
+  int f, y, z;
+  pauli(b, nq, f, y, z);
+  Zw acc{0, 0, 0, 0};
+  for (int x = 0; x < (1 << nq); x++) {
+    const Zw32 u = row[x ^ f], v = row[x];
+    if (zzero32(u) || zzero32(v)) continue;
+    acc = zadd(acc, zmul(zconj(ld(u)), zmul(ld(v), zwpow(pphase(x, y, z)))));
+  }
+  return zeq(acc, nrm) || zeq(acc, zneg(nrm));
+}
+HD inline Zw row_norm(const Zw32 *row, int N) {
+  Zw acc{0, 0, 0, 0};
+  for (int x = 0; x < N; x++) if (!zzero32(row[x])) acc = zadd(acc, zmul(zconj(ld(row[x])), ld(row[x])));
+  return acc;
+}
+HD inline bool nullity_ok(const Zw32 *row, int N) {     // int64 safe: N * 4 * B^2 < 2^62
+  int64_t B = 0;
+  for (int x = 0; x < N; x++) { const int64_t v = zbig(row[x]); if (v > B) B = v; }
+  return B < (1LL << 27);
+}
+HD inline int ilog2(int c) { int r = 0; while ((2 << r) <= c) r++; return r; }
+
+HD inline Zw zsub(Zw x, Zw y) { return {x.a - y.a, x.b - y.b, x.c - y.c, x.d - y.d}; }
+HD inline Zw det_small(const Zw *M, int r, int stride) {   // r <= 4, Laplace along the first row
+  if (r == 1) return M[0];
+  if (r == 2) return zsub(zmul(M[0], M[stride + 1]), zmul(M[1], M[stride]));
+  Zw acc{0, 0, 0, 0};
+  Zw sub[9];
+  for (int j = 0; j < r; j++) {
+    if (zzero(M[j])) continue;
+    int t = 0;
+    for (int i = 1; i < r; i++) for (int c = 0; c < r; c++) if (c != j) sub[t++] = M[i * stride + c];
+    const Zw d = zmul(M[j], det_small(sub, r - 1, r - 1));
+    acc = (j & 1) ? zsub(acc, d) : zadd(acc, d);
+  }
+  return acc;
+}
+// exact Schmidt rank of the row reshaped (qubits A, |A| = sa rows side) x (rest); -1 if coefficients too large
+HD inline int row_rank(const Zw32 *row, int nq, int A, int sa) {
+  const int R = 1 << sa, C = 1 << (nq - sa), N = 1 << nq;
+  Zw M[4 * 16];
+  int64_t B = 0;
+  for (int x = 0; x < N; x++) {
+    int ia = 0, ib = 0, na = 0, nb = 0;
+    for (int q = 0; q < nq; q++) { if ((A >> q) & 1) ia |= ((x >> q) & 1) << na++; else ib |= ((x >> q) & 1) << nb++; }
+    M[ia * C + ib] = ld(row[x]);
+    const int64_t v = zbig(row[x]); if (v > B) B = v;
+  }
+  const int64_t lim[5] = {0, 1LL << 40, 1LL << 29, 1LL << 18, 1LL << 12};
+  for (int r = R < C ? R : C; r >= 2; r--) {
+    if (B >= lim[r]) return -1;
+    int rs[4], cs[4];                                // r-subsets of rows and columns as bitmasks
+    for (int rm = 0; rm < (1 << R); rm++) {
+      if (popc(rm) != r) continue;
+      int t = 0; for (int i = 0; i < R; i++) if ((rm >> i) & 1) rs[t++] = i;
+      for (int cm = 0; cm < (1 << C); cm++) {
+        if (popc(cm) != r) continue;
+        int u = 0; for (int i = 0; i < C; i++) if ((cm >> i) & 1) cs[u++] = i;
+        Zw sub[16];
+        for (int i = 0; i < r; i++) for (int j = 0; j < r; j++) sub[i * r + j] = M[rs[i] * C + cs[j]];
+        if (!zzero(det_small(sub, r, r))) return r;
+      }
+    }
+  }
+  for (int x = 0; x < N; x++) if (!zzero32(row[x])) return 1;
+  return 0;
+}
+HD inline int rank_need(int rv, int rt) {     // fewest crossing CX/CZ between Schmidt ranks rv and rt
+  if (rv < 0 || rt <= 0 || rv == 0) return 0;
+  int lo = rv < rt ? rv : rt, hi = rv < rt ? rt : rv, c = 0;
+  while ((lo << c) < hi) c++;
+  return c;
+}
+HD inline int ginfo_w(const Spec &sp) { return 2 + sp.ncuts; }
+HD inline int cx_from_needs(const int *need, const Spec &sp) {
+  int idx = 0, mult = 1, mx = 0;
+  for (int i = 0; i < sp.ncuts; i++) {
+    int nd = need[i];
+    if (nd > sp.rad[i] - 1) nd = sp.rad[i] - 1;
+    idx += nd * mult;
+    mult *= sp.rad[i];
+    if (nd > mx) mx = nd;
+  }
+  return sp.have_table ? sp.cxtable[idx] : mx;
+}
+template <int NQ> HD inline void state_cheap(const Mat<NQ> &S, const Spec &sp, int &h, int &c2) {
+  constexpr int N = 1 << NQ;
+  int need[CUTMAX] = {0};
+  h = 0;
+  for (int j = 0; j < sp.m; j++) {
+    const int *gi = sp.ginfo + j * ginfo_w(sp);
+    const int d = row_sde(S.e + j * N, N, S.k) - gi[0];
+    if ((d < 0 ? -d : d) > h) h = d < 0 ? -d : d;
+    for (int c = 0; c < sp.ncuts; c++) {
+      const int nd = rank_need(row_rank(S.e + j * N, NQ, sp.cutmask[c], sp.cutsize[c]), gi[2 + c]);
+      if (nd > need[c]) need[c] = nd;
+    }
+  }
+  c2 = cx_from_needs(need, sp);
+}
+template <int NQ> HD inline int state_t(const Mat<NQ> &S, const Spec &sp) {
+  constexpr int N = 1 << NQ;
+  int best = 0;
+  for (int j = 0; j < sp.m; j++) {
+    const Zw32 *row = S.e + j * N;
+    if (!nullity_ok(row, N)) continue;
+    const Zw nrm = row_norm(row, N);
+    int cnt = 0;
+    for (int b = 0; b < (1 << (2 * NQ)); b++) cnt += pauli_stab(row, NQ, b, nrm);
+    const int d = (NQ - ilog2(cnt)) - sp.ginfo[j * ginfo_w(sp) + 1];
+    if ((d < 0 ? -d : d) > best) best = d < 0 ? -d : d;
+  }
+  return best;
+}
+
 template <int NQ> HD inline int cx_bound(const Mat<NQ> &S, const Spec &sp) {
   int idx = 0, mult = 1, mx = 0;
   for (int i = 0; i < sp.ncuts; i++) {
@@ -461,10 +609,17 @@ template <int NQ> struct Cheap {
     Mat<NQ> C = R[i];
     apply_inv(C, sp.gates[g]);
     if (C.ovf || R[i].ovf) { status[o] = OVF; return; }
-    if (is_identity(C)) { status[o] = FOUND; return; }
-    if (!sp.standard) { status[o] = ALIVE; hash2(C, h1[o], h2[o]); return; }
-    const int hs = h_struct(C), h = C.k > hs ? C.k : hs;
-    const int supp = support(C), c2 = cx_bound(C, sp);
+    if (is_goal(C, sp)) { status[o] = FOUND; return; }
+    if (!sp.standard && !sp.lite) { status[o] = ALIVE; hash2(C, h1[o], h2[o]); return; }
+    int h, supp = 0, c2 = 0;
+    if (sp.lite) h = C.k;
+    else
+    if (sp.states) state_cheap(C, sp, h, c2);
+    else if (!sp.lite) {
+      const int hs = h_struct(C);
+      h = C.k > hs ? C.k : hs;
+      supp = support(C); c2 = cx_bound(C, sp);
+    }
     if (combine(h, 0, c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
     status[o] = NEEDT;
     cheap[o] = h | (c2 << 10) | (supp << 20);
@@ -484,9 +639,10 @@ template <int NQ> struct Full {             // pass 2, on NEEDT children only: T
     apply_inv(C, sp.gates[g]);
     const int c = cheap[o], h = c & 1023, c2 = (c >> 10) & 1023, supp = c >> 20;
 #ifdef CHECK_T
-    if (ptm_wht(C) != ptm_sde(C)) { std::printf("T MISMATCH %d %d k=%d\n", ptm_wht(C), ptm_sde(C), C.k); std::abort(); }
+    if (!sp.states && ptm_wht(C) != ptm_sde(C)) { std::printf("T MISMATCH %d %d k=%d\n", ptm_wht(C), ptm_sde(C), C.k); std::abort(); }
 #endif
-    if (combine(h, ptm_wht(C), c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
+    const int T = sp.states ? state_t(C, sp) : (ptm_wht(C) + sp.tdiv - 1) / sp.tdiv;
+    if (combine(h, T, c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
     status[o] = ALIVE;
     hash2(C, h1[o], h2[o]);
   }
@@ -680,8 +836,57 @@ template <int NQ> __device__ int warp_cx_bound(const Zw32 *S, uint32_t *M, uint3
   return sp.have_table ? sp.cxtable[idx] : mx;
 }
 
+template <int NQ> __device__ bool warp_goal(const Zw32 *S, int k, const Spec &sp, int lane) {
+  constexpr int E = (1 << NQ) * (1 << NQ);
+  if (k != sp.gk) return false;
+  bool ok = true;
+  for (int e = lane; e < E; e += 32) {
+    const Zw g = sp.goal[e];
+    const Zw32 x = S[e];
+    if (x.a != g.a || x.b != g.b || x.c != g.c || x.d != g.d) ok = false;
+  }
+  return __all_sync(FULL_MASK, ok);
+}
+__device__ inline int warp_max(int v) {
+  for (int m = 16; m; m >>= 1) { const int o = __shfl_xor_sync(FULL_MASK, v, m); if (o > v) v = o; }
+  return v;
+}
+template <int NQ> __device__ void warp_state_cheap(const Zw32 *S, int k, const Spec &sp, int lane, int &h, int &c2) {
+  constexpr int N = 1 << NQ;
+  const int W = ginfo_w(sp);
+  int d = 0;
+  if (lane < sp.m) { d = row_sde(S + lane * N, N, k) - sp.ginfo[lane * W]; if (d < 0) d = -d; }
+  h = warp_max(d);
+  int mine[CUTMAX] = {0}, need[CUTMAX];
+  for (int it = lane; it < sp.m * sp.ncuts; it += 32) {
+    const int j = it / sp.ncuts, c = it % sp.ncuts;
+    const int nd = rank_need(row_rank(S + j * N, NQ, sp.cutmask[c], sp.cutsize[c]), sp.ginfo[j * W + 2 + c]);
+    if (nd > mine[c]) mine[c] = nd;
+  }
+  for (int c = 0; c < sp.ncuts; c++) need[c] = warp_max(mine[c]);
+  c2 = cx_from_needs(need, sp);
+}
+template <int NQ> __device__ int warp_state_t(const Zw32 *S, const Spec &sp, int lane) {
+  constexpr int N = 1 << NQ, P = 1 << (2 * NQ);
+  int best = 0;
+  for (int j = 0; j < sp.m; j++) {
+    const Zw32 *row = S + j * N;
+    if (!nullity_ok(row, N)) continue;
+    const Zw nrm = row_norm(row, N);
+    int cnt = 0;
+    for (int b0 = 0; b0 < P; b0 += 32) {
+      const int b = b0 + lane;
+      cnt += __popc(__ballot_sync(FULL_MASK, b < P && pauli_stab(row, NQ, b, nrm)));
+    }
+    int d = (NQ - ilog2(cnt)) - sp.ginfo[j * ginfo_w(sp) + 1];
+    if (d < 0) d = -d;
+    if (d > best) best = d;
+  }
+  return best;
+}
+
 // one level, fused: one warp per child does windows, child residual, identity, cheap bounds, T bound, hash
-template <int NQ> __global__ void __launch_bounds__(32 * WPB)
+template <int NQ, bool ST> __global__ void __launch_bounds__(32 * WPB)
 level_warp(Spec sp, const Node *parents, const Mat<NQ> *R, long nc, uint8_t *status, uint64_t *h1, uint64_t *h2, int t) {
   constexpr int N = 1 << NQ, E = N * N;
   __shared__ Zw32 shS[WPB][E];
@@ -699,10 +904,23 @@ level_warp(Spec sp, const Node *parents, const Mat<NQ> *R, long nc, uint8_t *sta
       bool ovf;
       const int k = warp_child<NQ>(S, R[i], sp.gates[g], lane, ovf);
       if (ovf) s = OVF;
-      else if (warp_identity<NQ>(S, k, lane)) s = FOUND;
+      else if (warp_goal<NQ>(S, k, sp, lane)) s = FOUND;
       else {
         bool alive = true;
-        if (sp.standard) {
+        if constexpr (ST) {
+          if (sp.standard) {
+          int h, c2;
+          warp_state_cheap<NQ>(S, k, sp, lane, h, c2);
+          if (combine(h, 0, c2, 0) > sp.depth - t) alive = false;
+          else alive = combine(h, warp_state_t<NQ>(S, sp, lane), c2, 0) <= sp.depth - t;
+          }
+        } else if (sp.lite) {
+          if (k > sp.depth - t) alive = false;
+          else {
+            const int T = 2 * (NQ + k) <= 64 ? warp_wht<NQ, uint32_t>(S, k, lane) : warp_wht<NQ, uint64_t>(S, k, lane);
+            alive = k + (T + sp.tdiv - 1) / sp.tdiv <= sp.depth - t;
+          }
+        } else if (sp.standard) {
           const int hs = warp_h_struct<NQ>(S, lane), h = k > hs ? k : hs;
           const int supp = warp_support<NQ>(S, lane), c2 = warp_cx_bound<NQ>(S, shM[w], shF[w], sp, lane);
           if (combine(h, 0, c2, supp) > sp.depth - t) alive = false;
@@ -760,13 +978,16 @@ template <int NQ> struct SameResidual {   // exact: hashes equal and the residua
 
 // ---------------- host ----------------
 struct HostSpec {
-  int n = 0, depth = 0, standard = 0, G = 0, tk = 0;
+  int n = 0, depth = 0, standard = 0, G = 0, tk = 0, lite = 0, tdiv = 1;
   std::vector<std::string> names;
   std::vector<Gate> gates;
   std::vector<uint8_t> bad2;
   std::vector<uint32_t> bad3;
   std::vector<Zw> target;
   std::vector<int> cutmask, cutsize, rad, cxtable;
+  int states = 0, m = 0, gk = 0;
+  std::vector<Zw> start, goal;
+  std::vector<int> ginfo;
 };
 
 static HostSpec read_spec(std::istream &in) {
@@ -777,9 +998,23 @@ static HostSpec read_spec(std::istream &in) {
   int version; in >> version;
   while (in >> tok) {
     if (tok == "n") in >> s.n;
-    else if (tok == "mode" || tok == "phase") { std::string v; in >> v; if (v != "unitary" && v != "exact") { std::cerr << "unsupported " << tok << " " << v << "\n"; std::exit(2); } }
+    else if (tok == "mode" || tok == "phase") {
+      std::string v; in >> v;
+      if (v == "states") s.states = 1;
+      else if (v != "unitary" && v != "exact") { std::cerr << "unsupported " << tok << " " << v << "\n"; std::exit(2); }
+    }
+    else if (tok == "pairs") in >> s.m;
+    else if (tok == "start") {
+      in >> s.tk; const int N = 1 << s.n; s.start.resize(N * N);
+      for (auto &x : s.start) in >> x.a >> x.b >> x.c >> x.d;
+    } else if (tok == "goal") {
+      int m; in >> m; s.ginfo.resize(m * (2 + s.cutmask.size()));
+      for (auto &v : s.ginfo) in >> v;
+    }
     else if (tok == "depth") in >> s.depth;
     else if (tok == "standard") in >> s.standard;
+    else if (tok == "lite") in >> s.lite;
+    else if (tok == "tdiv") in >> s.tdiv;
     else if (tok == "gates") {
       in >> s.G;
       if (s.G > GMAX) { std::cerr << "too many gates\n"; std::exit(2); }
@@ -789,9 +1024,14 @@ static HostSpec read_spec(std::istream &in) {
         for (int j = 0; j < gt.nq; j++) in >> gt.q[j];
         const int L = 1 << gt.nq;
         in >> gk;
-        for (int i = 0; i < L * L; i++) { Zw x; in >> x.a >> x.b >> x.c >> x.d; (void)x; }   // forward matrix (unused)
+        Zw fwd[LMAX * LMAX];
+        for (int i = 0; i < L * L; i++) in >> fwd[i].a >> fwd[i].b >> fwd[i].c >> fwd[i].d;
         in >> gt.ik;
         for (int i = 0; i < L * L; i++) in >> gt.inv[i].a >> gt.inv[i].b >> gt.inv[i].c >> gt.inv[i].d;
+        if (s.states) {          // rows are images p|in_j> transposed: W <- W g^T, so multiply by the transpose
+          gt.ik = gk;
+          for (int a = 0; a < L; a++) for (int b = 0; b < L; b++) gt.inv[a * L + b] = fwd[b * L + a];
+        }
         s.names.push_back(name); s.gates.push_back(gt);
       }
     } else if (tok == "bad2") {
@@ -801,8 +1041,13 @@ static HostSpec read_spec(std::istream &in) {
       int m; in >> m; s.bad3.assign((s.G * s.G * s.G + 31) / 32, 0);
       for (int i = 0; i < m; i++) { int a, b, c; in >> a >> b >> c; const uint32_t t = (a * s.G + b) * s.G + c; s.bad3[t >> 5] |= 1u << (t & 31); }
     } else if (tok == "target") {
-      in >> s.tk; const int N = 1 << s.n; s.target.resize(N * N);
-      for (auto &x : s.target) in >> x.a >> x.b >> x.c >> x.d;
+      int k; in >> k; const int N = 1 << s.n; std::vector<Zw> M(N * N);
+      for (auto &x : M) in >> x.a >> x.b >> x.c >> x.d;
+      if (s.states) { s.goal = M; s.gk = k; }
+      else {                   // unitary: the residual starts at U and must reach I
+        s.target = M; s.tk = k; s.gk = 0; s.goal.assign(N * N, Zw{0, 0, 0, 0});
+        for (int i = 0; i < N; i++) s.goal[i * N + i] = Zw{1, 0, 0, 0};
+      }
     } else if (tok == "cuts") {
       int m; in >> m;
       for (int i = 0; i < m; i++) {
@@ -814,6 +1059,10 @@ static HostSpec read_spec(std::istream &in) {
       int m; in >> m; s.cxtable.resize(m); for (auto &v : s.cxtable) in >> v;
     } else if (tok == "end") break;
     else { std::cerr << "unknown spec field " << tok << "\n"; std::exit(2); }
+  }
+  if (s.states) {
+    if (s.start.empty() || s.goal.empty() || s.ginfo.empty() || s.m < 1 || s.m > (1 << s.n)) { std::cerr << "states spec incomplete\n"; std::exit(2); }
+    s.target = s.start;
   }
   if (s.bad2.empty()) s.bad2.assign(s.G * s.G, 0);
   if (s.bad3.empty()) s.bad3.assign((s.G * s.G * s.G + 31) / 32, 0);
@@ -847,6 +1096,8 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
   thrust::device_vector<uint32_t> d_bad3(hs.bad3.begin(), hs.bad3.end());
   thrust::device_vector<Zw> d_target(hs.target.begin(), hs.target.end());
   thrust::device_vector<int> d_cx(hs.cxtable.empty() ? std::vector<int>{0} : hs.cxtable);
+  thrust::device_vector<Zw> d_goal(hs.goal.begin(), hs.goal.end());
+  thrust::device_vector<int> d_ginfo(hs.ginfo.empty() ? std::vector<int>{0} : hs.ginfo);
   Spec sp{};
   sp.n = hs.n; sp.N = 1 << hs.n; sp.G = hs.G; sp.depth = depth; sp.standard = hs.standard;
   sp.ncuts = (int)hs.cutmask.size();
@@ -859,6 +1110,10 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
   sp.target = thrust::raw_pointer_cast(d_target.data());
   sp.tk = hs.tk;
   sp.cxtable = thrust::raw_pointer_cast(d_cx.data());
+  sp.lite = hs.lite; sp.tdiv = hs.tdiv < 1 ? 1 : hs.tdiv;
+  sp.states = hs.states; sp.m = hs.states ? hs.m : (1 << hs.n); sp.gk = hs.gk;
+  sp.goal = thrust::raw_pointer_cast(d_goal.data());
+  sp.ginfo = thrust::raw_pointer_cast(d_ginfo.data());
 
   thrust::device_vector<Node> frontier(1);
   { Node root{}; frontier[0] = root; }
@@ -866,7 +1121,9 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
     Mat<NQ> S; S.ovf = 0; S.k = hs.tk;
     for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) S.e[i] = st(hs.target[i], S.ovf);
     if (S.ovf) { std::fprintf(stderr, "target coefficients exceed int32: rebuild with -DSTORE64\n"); return 4; }
-    if (is_identity(S)) { std::printf("{\"found\": 0, \"circuit\": []}\n"); return 0; }
+    bool done = S.k == hs.gk;
+    for (int i = 0; done && i < (1 << NQ) * (1 << NQ); i++) done = zeq(ld(S.e[i]), hs.goal[i]);
+    if (done) { std::printf("{\"found\": 0, \"circuit\": []}\n"); return 0; }
   }
   for (int t = 1; t <= depth; t++) {
     const double t0 = now();
@@ -890,7 +1147,8 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
       {   // passes 1 + 2 fused, one warp per child
         Pass p_(1);
         const long blocks = std::min(((long)nc + WPB - 1) / WPB, 65535L * 4);
-        level_warp<NQ><<<(unsigned)blocks, 32 * WPB>>>(sp, par, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
+        if (sp.states) level_warp<NQ, true><<<(unsigned)blocks, 32 * WPB>>>(sp, par, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
+        else level_warp<NQ, false><<<(unsigned)blocks, 32 * WPB>>>(sp, par, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
         cuda_check("level kernel");
       }
       if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
@@ -934,7 +1192,7 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
       }
       const long na = thrust::count(status.begin(), status.end(), (uint8_t)ALIVE);
       n_alive += na;
-      if (na && found.empty()) {
+      if (na && found.empty() && t < depth) {          // last level: survivors are never expanded
         thrust::device_vector<int> idx(na);
         thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)(cm * hs.G)),
                         status.begin(), idx.begin(), IsStatus{ALIVE});
@@ -967,14 +1225,16 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
     if (next.empty()) return 1;
     frontier.swap(next);
   }
-  std::printf("{\"depth\": %d, \"result\": \"open\", \"frontier\": %ld}\n", depth, (long)frontier.size());
-  return 2;
+  // every prefix of <= depth gates was checked against the goal (pruning, windows and dedupe are sound), so a
+  // frontier left at the last level is still a proof: no circuit of <= depth gates
+  std::printf("{\"depth\": %d, \"proved_unsat\": true, \"frontier\": %ld}\n", depth, (long)frontier.size());
+  return 1;
 }
 
 int main(int argc, char **argv) {
   if (argc < 2) {
     std::fprintf(stderr, "usage: cudasynth SPEC [--depth D] [--no-dedupe] [--chunk PARENTS]\n"
-                         "exit 0: circuit found, 1: no circuit of <= depth gates (proof), 2: open\n");
+                         "exit 0: circuit found, 1: no circuit of <= depth gates (proof)\n");
     return 3;
   }
   std::ifstream f(argv[1]);
@@ -988,6 +1248,12 @@ int main(int argc, char **argv) {
   }
   if (depth > DMAX) { std::fprintf(stderr, "depth > %d\n", DMAX); return 3; }
   std::fprintf(stderr, "cudasynth: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
+#ifdef __CUDACC__
+  if (hs.states) {   // the GPU state-target kernel aborts on some inputs (under investigation); CPU path validated
+    std::fprintf(stderr, "state targets: GPU path not ready yet, use build/cudasynth-cpu\n");
+    return 3;
+  }
+#endif
   int rc = 3;
   switch (hs.n) {   // qubit counts compiled in: NQ_MIN..NQ_MAX (each one is a full instantiation; nvcc is slow)
 #if NQ_MIN <= 1 && NQ_MAX >= 1

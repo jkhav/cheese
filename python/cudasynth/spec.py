@@ -226,18 +226,148 @@ def cx_table(n):
     return cs, rad, best
 
 
+# ---------- state targets (RUS without measurement): C |in_j> = Ref |in_j> exactly ----------
+def conj(x):
+    a, b, c, d = x
+    return (a, -d, -c, -b)
+
+
+def row_sde(k, row):
+    """least s >= 0 with sqrt2^s * (row / sqrt2^k) integral"""
+    v = min((val(x) for x in row if x != ZERO), default=0)
+    return max(0, k - v)
+
+
+def val(x):
+    v = 0
+    while (y := down(x)) is not None:
+        x, v = y, v + 1
+        if v > 400:
+            break
+    return v
+
+
+def pauli_apply(n, b, row):
+    """P_b |row> for Pauli digits per qubit (0 I, 1 X, 2 Y, 3 Z)"""
+    out = [ZERO] * len(row)
+    for x, amp in enumerate(row):
+        if amp == ZERO:
+            continue
+        flip = ph = 0
+        for q in range(n):
+            dgt = (b >> (2 * q)) & 3
+            bit = (x >> q) & 1
+            if dgt == 1:
+                flip |= 1 << q
+            elif dgt == 2:
+                flip |= 1 << q
+                ph += 2 + 4 * bit
+            elif dgt == 3:
+                ph += 4 * bit
+        out[x ^ flip] = mul(amp, wpow(ph))
+    return out
+
+
+def inner(u, v):
+    acc = ZERO
+    for x, y in zip(u, v):
+        if x != ZERO and y != ZERO:
+            acc = add(acc, mul(conj(x), y))
+    return acc
+
+
+def nullity(n, row):
+    """stabilizer nullity n - log2 |{P : P|v> = +-|v>}| (Clifford-invariant, changes by <= 1 per T)"""
+    nrm = inner(row, row)
+    neg = tuple(-c for c in nrm)
+    cnt = sum(1 for b in range(4 ** n) if inner(row, pauli_apply(n, b, row)) in (nrm, neg))
+    return n - (cnt.bit_length() - 1)
+
+
+def det(M):
+    if len(M) == 1:
+        return M[0][0]
+    acc = ZERO
+    for j in range(len(M)):
+        if M[0][j] != ZERO:
+            sub = [r[:j] + r[j + 1:] for r in M[1:]]
+            t = mul(M[0][j], det(sub))
+            acc = add(acc, t if j % 2 == 0 else tuple(-c for c in t))
+    return acc
+
+
+def schmidt_rank(n, A, row):
+    """exact rank of the state reshaped (qubits A) x (rest): largest nonzero minor"""
+    B = [q for q in range(n) if q not in A]
+    R, C = 1 << len(A), 1 << len(B)
+    M = [[ZERO] * C for _ in range(R)]
+    for x, amp in enumerate(row):
+        ia = sum(((x >> q) & 1) << i for i, q in enumerate(A))
+        ib = sum(((x >> q) & 1) << i for i, q in enumerate(B))
+        M[ia][ib] = amp
+    for r in range(min(R, C), 0, -1):
+        for rows in itertools.combinations(range(R), r):
+            for cols in itertools.combinations(range(C), r):
+                if det([[M[i][j] for j in cols] for i in rows]) != ZERO:
+                    return r
+    return 0
+
+
+def state_pairs(n, U, inputs):
+    """start rows e_x and goal rows Ref e_x (the transposed images), shared exponents"""
+    k, M = U
+    N = 1 << n
+    start = [[(1, 0, 0, 0) if c == x else ZERO for c in range(N)] for x in inputs]
+    goal = [[M[r][x] for r in range(N)] for x in inputs]
+    pad = [[ZERO] * N for _ in range(N - len(inputs))]
+    gk, G = normalise(k, goal + pad)
+    return (0, tuple(tuple(r) for r in start + pad)), (gk, G)
+
+
+# ---------- gate sets with ccx: H and (weighted) T bounds stay sound ----------
+def ptm_sde(g):
+    """sde of the Pauli-transfer matrix of gate g on its own qubits: the most one gate can change the T bound"""
+    gk, M = GATES[g]
+    nq = len(M).bit_length() - 1
+    k, U = gate_matrix(g, tuple(range(nq)), nq)
+    N, best = 1 << nq, 0
+    cols = [[U[r][c] for r in range(N)] for c in range(N)]
+    for b in range(4 ** nq):
+        PB = [pauli_apply(nq, b, [ZERO] * c + [(1, 0, 0, 0)] + [ZERO] * (N - c - 1)) for c in range(N)]
+        UPB = [[sum_z(mul(U[r][x], PB[c][x]) for x in range(N)) for c in range(N)] for r in range(N)]   # U P_b
+        for a in range(4 ** nq):
+            acc = ZERO
+            for c in range(N):                       # Tr(P_a U P_b U^dag) = sum_c <col_c(U)| P_a |col_c(U P_b)>
+                v = pauli_apply(nq, a, [UPB[r][c] for r in range(N)])
+                acc = add(acc, inner(cols[c], v))
+            if acc != ZERO:
+                best = max(best, 2 * (nq + k) - val(acc))
+    return best
+
+
+def sum_z(it):
+    acc = ZERO
+    for x in it:
+        acc = add(acc, x)
+    return acc
+
+
 # ---------- spec ----------
-def write_spec(out, n, circ, depth, gates=None, use3=True):
+def write_spec(out, n, circ, depth, gates=None, use3=True, inputs=None):
     gates = sorted(set(CLIFFORD_T) | {g for g, _ in circ}) if gates is None else gates
     cs = candidates(n, gates)
     bad2, bad3 = sym_rules(cs, use3)
     k, U = unitary(n, circ)
     cuts_, rad, table = cx_table(n)
     standard = set(gates) <= STANDARD
+    lite = not standard and set(gates) <= STANDARD | {"ccx"}     # ccx: a permutation, no sqrt2
+    tdiv = max(ptm_sde(g) for g in gates if g in ("t", "tdg", "ccx")) if lite else 1
     w = out.write
     w("cudasynth-spec 1\n")
-    w(f"n {n}\nmode unitary\nphase exact\ndepth {depth}\n")
+    w(f"n {n}\nmode {'unitary' if inputs is None else 'states'}\nphase exact\ndepth {depth}\n")
     w(f"standard {int(standard)}\n")                # H-, T- and structure bounds valid for this gate set
+    if lite:                                         # only H (sde) and T / tdiv (T and ccx change the PTM sde by <= tdiv)
+        w(f"lite 1\ntdiv {tdiv}\n")
     w(f"gates {len(cs)}\n")
     for name, g, qs in cs:
         gk, M = GATES[g]
@@ -263,8 +393,20 @@ def write_spec(out, n, circ, depth, gates=None, use3=True):
           f" {ik} {' '.join(' '.join(map(str, x)) for x in inv)}\n")
     w(f"bad2 {len(bad2)}\n" + "".join(f"{a} {b}\n" for a, b in bad2))
     w(f"bad3 {len(bad3)}\n" + "".join(f"{a} {b} {c}\n" for a, b, c in bad3))
-    w(f"target {k}\n" + "".join(" ".join(" ".join(map(str, x)) for x in row) + "\n" for row in U))
+    mat = lambda kk, M: f"{kk}\n" + "".join(" ".join(" ".join(map(str, x)) for x in row) + "\n" for row in M)
+    if inputs is None:
+        w("target " + mat(k, U))
+    else:
+        (sk, S), (gk, G) = state_pairs(n, (k, U), inputs)
+        w(f"pairs {len(inputs)}\n")
+        w("start " + mat(sk, S))
+        w("target " + mat(gk, G))
     w(f"cuts {len(cuts_)}\n" + "".join(f"{len(A)} {' '.join(map(str, A))}\n" for A in cuts_))
+    if inputs is not None:                           # goal side of the state bounds: sde, nullity, Schmidt ranks
+        w(f"goal {len(inputs)}\n")
+        for j in range(len(inputs)):
+            row = G[j]
+            w(f"{row_sde(gk, row)} {nullity(n, row)} " + " ".join(str(schmidt_rank(n, A, row)) for A in cuts_) + "\n")
     if table is None:
         w("cxtable 0\n")
     else:
@@ -273,13 +415,25 @@ def write_spec(out, n, circ, depth, gates=None, use3=True):
     return cs, bad2, bad3
 
 
+def state_inputs(n, o):
+    if o.inputs:
+        return [int(x) for x in o.inputs.split(",")]
+    if o.ancilla:
+        mask = sum(1 << q for q in o.ancilla)
+        return [x for x in range(1 << n) if not x & mask]
+    return None
+
+
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a.add_argument("qasm"); a.add_argument("depth", type=int)
     a.add_argument("--no-w3", action="store_true")
+    a.add_argument("--ancilla", type=int, nargs="+", help="state target: these qubits start in |0>; inputs = "
+                   "every basis state with them 0 (RUS without measurement: C|x,0> = Ref|x,0>)")
+    a.add_argument("--inputs", help="state target: comma-separated input basis states (integers, bit q = qubit q)")
     o = a.parse_args()
     n, circ = parse_qasm(o.qasm)
-    cs, bad2, bad3 = write_spec(sys.stdout, n, circ, o.depth, use3=not o.no_w3)
+    cs, bad2, bad3 = write_spec(sys.stdout, n, circ, o.depth, use3=not o.no_w3, inputs=state_inputs(n, o))
     print(f"{Path(o.qasm).stem}: {n} qubits, {len(cs)} candidates, W2 pairs {len(bad2)}, W3 triples {len(bad3)}",
           file=sys.stderr)
 
