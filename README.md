@@ -90,6 +90,7 @@ replaces every Clifford segment between T gates by an optimal one from a GPU tab
 (up to 3 qubits) and beam-searches where the T gates sit to make the total small. Every result is checked
 exactly. Method: [docs/ALGORITHM.md](docs/ALGORITHM.md) section 10.
 
+## License
 
 MIT, see [LICENSE](LICENSE). Benchmark circuits in `benchmarks/` come from milq and the sources named in
 their READMEs (MQT Bench, published RUS papers).
