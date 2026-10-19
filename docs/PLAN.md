@@ -1,0 +1,125 @@
+# cudasynth: GPU branch-and-bound synthesis, plan
+
+Copied from milq `misc/GPU_SEARCH_PLAN.md` (2026-10-19). Paths below starting with `misc/` refer to the milq
+repository. The CPU prototype there, `misc/prototypes/prune_probe.py` (Python, 10 processes), proves depths no
+SAT run reached (Toffoli 9, CCZ 8, half_adder_3 9, Fredkin 9; 30-180 s each) and finds optimal circuits (CS = 5).
+This repository moves it to GPUs (an RTX card first, a university cluster later) and extends it to RUS targets.
+
+## 0. Decisions (2026-10-19)
+
+- CUDA C++ from the start (the Python prototype in milq is the correctness oracle; no CuPy stage).
+- Exact arithmetic: entries in Z[w] as four integers (a, b, c, d) = a + b w + c w^2 + d w^3, one sqrt2 exponent
+  k per vector (MILQ's five-tuple with the exponent shared by the vector), normalised so equal states have equal
+  bits; int32 with an overflow check, int64 fallback.
+- Input = a spec: number of qubits, the gate set (each gate's exact local matrix and the qubits it acts on), the
+  vector pairs to map (in_j -> out_j; full unitary = every basis state), the phase mode (exact / one global phase),
+  the depth bound and the mode (prove / find / all). Gate classes for the bounds (sqrt2-raising, non-Clifford,
+  entangling) are derived from the exact matrices; a bound whose assumption fails is switched off.
+- Search: level-synchronous branch-and-bound first, then meet-in-the-middle (exact and complete; memory-bound).
+- Every per-prefix function is `__host__ __device__`, so the same code runs on the CPU (development, tests on a
+  machine without an NVIDIA GPU) and on the GPU.
+
+## 1. What the algorithm is
+
+Level-synchronous branch-and-bound over gate sequences ("brute force with proofs"):
+
+    frontier_0 = {empty prefix};  for t = 1..D:
+      expand   every prefix p in frontier_{t-1} by every allowed gate g (W2 table)        -> p·g
+      update   residual S = U (p·g)^-1   (one sparse gate applied to the stored S)
+      check    S == I  -> circuit found (depth t)
+      bound    lb(S) = H + T + CX + support lower bounds (depth_bounds.py); drop if lb(S) > D - t
+      dedupe   keep one prefix per distinct S (transposition table): equal S = equal subtree
+      frontier_t = survivors;  empty -> depth D proven impossible
+
+Everything per prefix is independent, so one level is one big batch of identical small jobs: a GPU workload.
+The work is *not* large-state simulation: it is 10^5-10^9 tiny exact matrices (4x4 to 32x32).
+
+Meet-in-the-middle (MITM) doubles the reach: tables of forward prefixes P (length <= a) and backward suffixes
+S (length <= b), both bound-pruned, joined on U = S·P via hashes of P and S^-1·U (sort-merge or hash join).
+
+## 2. Existing options (what to reuse, what to write)
+
+| option | what it is | fit for us |
+|---|---|---|
+| cuQuantum cuStateVec, incl. `apply_matrix_batched` [1] | NVIDIA's state-vector simulator; batched API for many small same-size state vectors | partial: batched gate application exists, but floating point only, one library call per gate over the whole batch, and no way to fuse our bounds, hashing or pruning into it. Use for final numerical cross-checks at most |
+| Qiskit Aer GPU, qsim, CUDA-Q | single large circuits (20-40 qubits), shots | no: wrong regime (one big state, not 10^8 tiny unitaries) |
+| CuPy / PyTorch / JAX | GPU array libraries: batched matmul, int64, sort, unique, compaction; CuPy RawKernel = inline CUDA | yes for the prototype: our numpy code ports almost 1:1; sort/unique give the transposition table |
+| Thrust / CUB (CUDA C++) | sort, unique, copy_if (stream compaction), scans | yes for the production version: all the "glue" of a level |
+| cuCollections (cuco) | GPU hash sets / maps | yes: transposition table and MITM join without full sorts |
+| RAPIDS cuDF | GPU dataframes, hash joins | optional: MITM join on very large tables |
+| mjarret/Exact-Synthesis [2] (2026) | CPU (12-core Ryzen), 2-qubit Clifford+T, T-count optimal: MITM + Clifford canonicalisation + exact SO(6) arithmetic in Z[1/sqrt2], concurrent hash sets; T-count 12 from identity in 414 s / 22 GB | reference design for the 2-qubit case (RUS 1-6, 12, 28 are 2-qubit): its packed exact arithmetic and canonicalisation are directly reusable ideas. Not GPU, T-count not gate count |
+| Amy-Maslov-Mosca-Roetteler MITM [3]; parallel deterministic walks [4] | the classic exact-synthesis searches (CPU) | algorithms to borrow (MITM, collision finding); [4] parallelises the search over workers |
+| Paetznick-Svore RUS direct search [5] | RUS circuits found by brute-force search over {Clifford,T} circuits with one ancilla, canonical single-qubit forms (>10^5 smaller space), split into thousands of cluster jobs | the RUS precedent: exactly this approach, on a cluster, without bounds or GPUs |
+| Golubitsky-Maslov 4-bit reversible [6] | optimal 4-bit reversible circuits by canonical-form BFS + MITM (1.2*10^11 circuits up to 9 gates) | canonical forms and storage tricks for large tables |
+
+Not found: a public GPU exact gate-count synthesiser for Clifford+T. GPU work in the area is stabilizer
+equivalence checking [7] and numerical instantiation (BQSKit/QFactor, JAX) - neither exact nor enumerative.
+
+**Decision: write the search ourselves, on library primitives.** The core (exact ring arithmetic, gate
+application, bounds, hashing) is small and specific; the glue (sort, unique, compaction, hash tables, batched
+matmul) comes from CuPy now and Thrust/CUB/cuco later. Off-the-shelf simulators would cost exactness and
+fusion and solve the wrong problem size.
+
+## 3. Representation (exact, hashable)
+
+- Matrix entries in Z[w]/sqrt2^k (w = e^{i pi/4}): four integers (a, b, c, d) + one shared exponent k per
+  matrix, as bvarr.py already does. int32 suffices for the depths here (coefficients grow ~sqrt2 per H);
+  overflow check per level, int64 fallback.
+- Sizes per residual: 2 qubits 16 entries (256 B), 3 qubits 64 (1 KB), 4 qubits 256 (4 KB), 5 qubits 1024 (16 KB).
+- Canonical key: reduce k while every entry is divisible by sqrt2; global phase fixed when the target allows
+  it; then a 128-bit hash of the exact integers (collisions checked on the exact data when merging).
+- Gate application is sparse: Paulis/S/T/CX/CZ are permutations with phases (index shuffles), H mixes row
+  pairs and raises k by 1. No general matmul needed for the search step.
+
+## 4. Bounds on the GPU (cheap first, exact, sound)
+
+| bound | computation | cost |
+|---|---|---|
+| H count: sde of the residual | max sqrt2-adic valuation over entries, integer ops | cheap |
+| support: qubits the residual touches | per-qubit identity test | cheap |
+| CX count: Schmidt ranks across each qubit cut | rank of reshaped matrices (exact Gaussian elimination mod a prime, or float SVD with a safe margin), then a lookup table over the small set of rank patterns (the ILP is precomputed) | moderate |
+| T count: sde of the Pauli-transfer matrix (Gosset et al.), exact via the Galois conjugate | batched matmul, 64x64 at 3 qubits, 256x256 at 4 | expensive: run only on prefixes that survive the cheap bounds |
+| W2 / W3 windows | table lookups on the last 2-3 gates | cheap |
+
+Soundness is checked like on the CPU: never prune a prefix of a known optimal circuit (the 33-circuit test),
+and GPU verdicts must equal the CPU prototype's on every instance where both finish.
+
+## 5. RUS
+
+RUS targets (no measurement, as in fastsynth `-v rus`): the circuit must map each input state |in_j> to its
+target |t_j> exactly. The residual is the set of pairs (p|in_j>, |t_j>), and the bounds become the state
+versions already in depth_bounds.py (sde per state, stabilizer nullity for T, Schmidt ranks for CX).
+MITM keys on the stacked images: forward P|in_j>, backward S^-1|t_j>. RUS instances here have 2-7 qubits and
+optimal sizes around 10-20 gates, so MITM is required for the larger ones; the 2-qubit ones (RUS 1-6, 12, 28)
+are the first targets, with [2] as a reference. Post-selection (the measured variant) is a later extension.
+
+## 6. Phases
+
+| phase | where | deliverable | gate to pass |
+|---|---|---|---|
+| 0. CPU reference | laptop, now | numpy-vectorised level evaluation + transposition table in `prune_probe.py`; measure the dedupe factor (distinct residuals / prefixes) | same verdicts as now; speed-up recorded |
+| 1. GPU prototype | RTX | CuPy: exact batched representation, sparse gate kernels, cheap bounds, sort/unique dedupe, compaction; T bound via batched matmul on survivors | identical verdicts on CS, Toffoli 7-9, CCZ 7-8, half_adder 7-9, Fredkin 9; >= 100x the Python prototype |
+| 2. MITM | RTX | forward/backward tables with pruning, GPU sort-merge or cuco hash join; unitary and RUS (state) keys | finds the known optima (CS 5, relative-phase Toffoli 9, RUS 4 = 18, RUS 8 = 11, RUS 14 = 12) |
+| 3. Production kernels | RTX | hot loops in CUDA C++ (Thrust/CUB/cuco), int32 packed arithmetic, fused expand+bound+hash kernel | >= 10x over phase 1 on the largest levels |
+| 4. Cluster | university cluster | subtree split at a shallow level into independent jobs (Slurm array, no communication; cross-job duplicates accepted); MITM join partitioned by hash bits | open depths: Toffoli 10+, CCZ 9+, Grover_3 10, RUS 5/6/13/17/21 |
+| 5. Integration | prototype | as a lower-bound oracle for the SAT walk and as the pruning source of a SAT propagator (§3.19 plan) | walk results improve on the 71 suite |
+
+## 7. Risks
+
+- Exponential growth stays: ~13x per level at 3 qubits until the bounds bite. Hardware buys about 2-3 levels;
+  dedupe and MITM buy more.
+- Weak bounds (CCZ starts at 4, RUS state bounds) mean more levels before pruning.
+- Finding circuits (SAT side) gets less pruning near the leaves than proving impossibility; MITM is the remedy.
+- Qubit count: 5+ qubits make the exact T bound (1024x1024 transfer matrix) too expensive; use the state
+  bounds there.
+- MITM memory: 10^8-10^9 keys of 16 B fit an RTX card's memory only partly; partition by hash bits, spill to host/disk.
+
+## Sources
+
+1. NVIDIA cuQuantum, custatevec `apply_matrix_batched`: https://docs.nvidia.com/cuda/cuquantum/latest/custatevec/overview/index.html
+2. High-Performance Exact Synthesis of Two-Qubit Quantum Circuits (2026): https://arxiv.org/abs/2601.19166, code https://github.com/mjarret/Exact-Synthesis
+3. Amy, Maslov, Mosca, Roetteler, A meet-in-the-middle algorithm for fast synthesis of depth-optimal quantum circuits: https://arxiv.org/abs/1206.0758
+4. Di Matteo, Mosca, Parallelizing quantum circuit synthesis: https://arxiv.org/abs/1606.07413
+5. Paetznick, Svore, Repeat-Until-Success: non-deterministic decomposition of single-qubit unitaries: https://arxiv.org/abs/1311.1074
+6. Golubitsky, Maslov, A study of optimal 4-bit reversible Toffoli circuits and their synthesis: https://arxiv.org/abs/1103.2686
+7. GPU-accelerated simulation / equivalence checking of stabilizer circuits: https://arxiv.org/abs/2603.14641
