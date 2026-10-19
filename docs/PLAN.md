@@ -19,6 +19,43 @@ This repository moves it to GPUs (an RTX card first, a university cluster later)
 - Every per-prefix function is `__host__ __device__`, so the same code runs on the CPU (development, tests on a
   machine without an NVIDIA GPU) and on the GPU.
 
+## Status (2026-10-19 evening)
+
+Implemented (`src/cudasynth.cu`, one source for both backends):
+- Exact unitary-target branch-and-bound (phase 1 of section 6): exact Z[w] arithmetic, W2/W3 window rules,
+  every bound of milq's `lower_bound(strong=True)` (H via sde, H structure, T via the exact PTM sde, CX via
+  operator-Schmidt ranks over F_p + the precomputed ILP table, support), exact deduplication of residuals keeping
+  the lexicographically smallest prefix (sound together with W2/W3).
+- Validated: per-level survivor counts identical to milq's `prune_probe.py`; found circuits re-checked exactly
+  (`python -m cudasynth.verify`). Regression: `tests/check.sh`.
+- Layout for the GPU:
+  - pass 0: each parent's residual S = U p^-1 computed once per level chunk;
+  - pass 1: one thread per child (W2/W3, gate, identity check, cheap bounds);
+  - pass 2: the expensive T bound only on the compacted children the cheap bounds kept;
+  - then compaction, sort by (hash, prefix) and exact unique.
+- Storage int32 (coefficients of sqrt2^k U grow like 2^(k/2); surviving residuals have k <= remaining budget
+  <= DMAX = 48, so ~2^25), arithmetic in int64, every narrowing checked: overflow aborts the run (exit 4) with
+  "rebuild with -DSTORE64". The T bound claims nothing when k is too large for int64 (k + 2n + 6 > 62).
+- Tooling: `install.sh` (driver check; nvcc from PATH, /usr/local/cuda or NVIDIA's pip wheels in .venv; build;
+  tests), `run.sh` (optimum by increasing budgets, every failed budget a proof, verified QASM out),
+  `tests/bench.sh` (timings).
+
+Results (CPU build, 12-thread laptop; no GPU numbers yet): Toffoli 9 7.9 s, CCZ 8 7.0 s, Toffoli 10 23 s,
+Toffoli 11 2.3 min (all impossible; no SAT run proved any of these). Dedupe removes 6-33% of survivors from
+level 4 on (Toffoli 11, level 6: 221,049 -> 147,656).
+
+Not implemented yet (in order):
+1. GPU memory layout, from the first GPU measurements: per-thread state small enough for registers, gate tables
+   and the CX table in shared memory, warp-cooperative PTM (one warp per child for the 4^n x 4^n transfer matrix).
+2. RUS / state targets: vector pairs instead of a full unitary, per-pair state bounds (section 5).
+3. Global-phase mode.
+4. Meet-in-the-middle (section 6, phase 2).
+5. Multi-GPU / cluster split (phase 4).
+
+Expected GPU speed (estimate, to be replaced by measurements): the current version about 3-10x the laptop CPU
+(int64 products, large per-thread state); after item 1 about 30-100x. Each extra depth costs ~6-7x the work
+(Toffoli 10 -> 11), so 100x is ~2 more depths at equal time.
+
 ## 1. What the algorithm is
 
 Level-synchronous branch-and-bound over gate sequences ("brute force with proofs"):

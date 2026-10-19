@@ -76,6 +76,28 @@ HD inline int zval(Zw x) {         // sqrt2-adic valuation, x != 0
   return v;
 }
 
+// Storage of residual matrices: int32 (default) or int64 (-DSTORE64); arithmetic in 64 bits, narrowed with an
+// overflow check. Coefficients of sqrt2^k U grow like 2^(k/2) (each H raises k by at most 1), and a surviving
+// prefix has k <= its remaining budget <= DMAX, so int32 holds every surviving residual; a target or child above
+// that is caught by the check (the run aborts) - build with -DSTORE64 for such inputs.
+#ifdef STORE64
+using StoreT = int64_t;
+HD inline bool fits(int64_t) { return true; }
+#else
+using StoreT = int32_t;
+HD inline bool fits(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+#endif
+struct Zw32 { StoreT a, b, c, d; };
+HD inline Zw ld(Zw32 x) { return {x.a, x.b, x.c, x.d}; }
+HD inline Zw32 st(Zw x, int &ovf) {
+  if (!fits(x.a) || !fits(x.b) || !fits(x.c) || !fits(x.d)) ovf = 1;
+  return {(StoreT)x.a, (StoreT)x.b, (StoreT)x.c, (StoreT)x.d};
+}
+HD inline bool zzero32(Zw32 x) { return !(x.a | x.b | x.c | x.d); }
+HD inline bool zeq32(Zw32 x, Zw32 y) { return x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d; }
+HD inline bool zdiv2ok32(Zw32 x) { return !((x.a - x.c) & 1) && !((x.b - x.d) & 1); }
+HD inline Zw32 zdown32(Zw32 x) { return {(x.b - x.d) / 2, (x.a + x.c) / 2, (x.b + x.d) / 2, (x.c - x.a) / 2}; }
+
 // ---------------- spec (device-readable) ----------------
 struct Gate {
   int nq, q[3], ik;                // inverse gate: local matrix / sqrt2^ik
@@ -95,15 +117,15 @@ struct Spec {
 // ---------------- exact matrices ----------------
 template <int NQ> struct Mat {
   static constexpr int N = 1 << NQ;
-  Zw e[N * N];
-  int k;
+  Zw32 e[N * N];
+  int k, ovf;                      // ovf: a value left the int32 range (the run aborts: never a silent wrong answer)
 };
 
 template <int NQ> HD inline void normalise(Mat<NQ> &S) {
   constexpr int N = 1 << NQ;
   while (S.k > 0) {
-    for (int i = 0; i < N * N; i++) if (!zdiv2ok(S.e[i])) return;
-    for (int i = 0; i < N * N; i++) S.e[i] = zdown(S.e[i]);
+    for (int i = 0; i < N * N; i++) if (!zdiv2ok32(S.e[i])) return;
+    for (int i = 0; i < N * N; i++) S.e[i] = zdown32(S.e[i]);
     S.k--;
   }
 }
@@ -128,11 +150,11 @@ template <int NQ> HD inline void apply_inv(Mat<NQ> &S, const Gate &g) {
         Zw acc{0, 0, 0, 0};
         for (int m = 0; m < L; m++) {
           const Zw gm = g.inv[m * L + lc];
-          if (!zzero(gm)) acc = zadd(acc, zmul(S.e[r * N + idx[m]], gm));
+          if (!zzero(gm)) acc = zadd(acc, zmul(ld(S.e[r * N + idx[m]]), gm));
         }
         col[lc] = acc;
       }
-      for (int lc = 0; lc < L; lc++) S.e[r * N + idx[lc]] = col[lc];
+      for (int lc = 0; lc < L; lc++) S.e[r * N + idx[lc]] = st(col[lc], S.ovf);
     }
   }
   S.k += g.ik;
@@ -141,7 +163,8 @@ template <int NQ> HD inline void apply_inv(Mat<NQ> &S, const Gate &g) {
 
 template <int NQ> HD inline void residual(Mat<NQ> &S, const Spec &sp, const uint8_t *seq, int len) {
   constexpr int N = 1 << NQ;
-  for (int i = 0; i < N * N; i++) S.e[i] = sp.target[i];
+  S.ovf = 0;
+  for (int i = 0; i < N * N; i++) S.e[i] = st(sp.target[i], S.ovf);
   S.k = sp.tk;
   for (int t = 0; t < len; t++) apply_inv(S, sp.gates[seq[t]]);
 }
@@ -151,8 +174,8 @@ template <int NQ> HD inline bool is_identity(const Mat<NQ> &S) {
   if (S.k) return false;
   for (int r = 0; r < N; r++)
     for (int c = 0; c < N; c++) {
-      const Zw x = S.e[r * N + c];
-      if (r == c ? !(x.a == 1 && !x.b && !x.c && !x.d) : !zzero(x)) return false;
+      const Zw32 x = S.e[r * N + c];
+      if (r == c ? !(x.a == 1 && !x.b && !x.c && !x.d) : !zzero32(x)) return false;
     }
   return true;
 }
@@ -166,9 +189,9 @@ template <int NQ> HD inline void hash2(const Mat<NQ> &S, uint64_t &h1, uint64_t 
   constexpr int N = 1 << NQ;
   h1 = mix(0x12345678ULL, S.k); h2 = mix(0x9abcdef0ULL, S.k);
   for (int i = 0; i < N * N; i++) {
-    const Zw x = S.e[i];
-    h1 = mix(mix(mix(mix(h1, x.a), x.b), x.c), x.d);
-    h2 = mix(mix(mix(mix(h2, x.d * 31 + 7), x.c), x.b), x.a);
+    const Zw32 x = S.e[i];
+    h1 = mix(mix(mix(mix(h1, (uint64_t)(int64_t)x.a), (uint64_t)(int64_t)x.b), (uint64_t)(int64_t)x.c), (uint64_t)(int64_t)x.d);
+    h2 = mix(mix(mix(mix(h2, (uint64_t)((int64_t)x.d * 31 + 7)), (uint64_t)(int64_t)x.c), (uint64_t)(int64_t)x.b), (uint64_t)(int64_t)x.a);
   }
 }
 
@@ -201,7 +224,7 @@ template <int NQ> HD inline int cut_rank(const Mat<NQ> &S, int A, int sa, uint64
         if ((A >> q) & 1) { oa |= ((o >> q) & 1) << na; ia |= ((i >> q) & 1) << na; na++; }
         else { ob |= ((o >> q) & 1) << nb; ib |= ((i >> q) & 1) << nb; nb++; }
       }
-      M[(oa << na) | ia][(ob << nb) | ib] = zmod(S.e[o * N + i], w);
+      M[(oa << na) | ia][(ob << nb) | ib] = zmod(ld(S.e[o * N + i]), w);
     }
   int rank = 0;
   for (int c = 0; c < C && rank < R; c++) {
@@ -228,8 +251,8 @@ template <int NQ> HD inline int support(const Mat<NQ> &S) {
     bool trivial = true;
     for (int r = 0; r < N && trivial; r++)
       for (int c = 0; c < N && trivial; c++) {
-        if ((r ^ c) & bit) { if (!zzero(S.e[r * N + c])) trivial = false; }
-        else if (!((r | c) & bit) && !zeq(S.e[r * N + c], S.e[(r | bit) * N + (c | bit)])) trivial = false;
+        if ((r ^ c) & bit) { if (!zzero32(S.e[r * N + c])) trivial = false; }
+        else if (!((r | c) & bit) && !zeq32(S.e[r * N + c], S.e[(r | bit) * N + (c | bit)])) trivial = false;
       }
     cnt += !trivial;
   }
@@ -242,7 +265,7 @@ template <int NQ> HD inline int h_struct(const Mat<NQ> &S) {
   int pi[N];
   for (int c = 0; c < N; c++) {
     int nz = 0, row = 0;
-    for (int r = 0; r < N; r++) if (!zzero(S.e[r * N + c])) { nz++; row = r; }
+    for (int r = 0; r < N; r++) if (!zzero32(S.e[r * N + c])) { nz++; row = r; }
     if (nz != 1) return 0;
     pi[c] = row;
   }
@@ -274,6 +297,8 @@ HD inline int pphase(int x, int ymask, int zmask) {      // power of w: Y|x> = i
 
 template <int NQ> HD inline int ptm_sde(const Mat<NQ> &S) {
   constexpr int N = 1 << NQ, P = 1 << (2 * NQ);
+  // |X_ab| <= ~2^k N^2 (coefficients ~2^(k/2), N^2 products summed): beyond int64, claim nothing (sound)
+  if (S.k + 2 * NQ + 6 > 62) return 0;
   int best = 0;
   Zw SP[N * N], M[N * N];
   for (int b = 0; b < P; b++) {
@@ -281,14 +306,14 @@ template <int NQ> HD inline int ptm_sde(const Mat<NQ> &S) {
     pauli(b, NQ, fb, yb, zb);
     for (int r = 0; r < N; r++)                          // (S' P_b)[r][c] = S'[r][c ^ fb] * phase(b, c)
       for (int c = 0; c < N; c++) {
-        const Zw x = S.e[r * N + (c ^ fb)];
+        const Zw x = ld(S.e[r * N + (c ^ fb)]);
         SP[r * N + c] = zzero(x) ? x : zmul(x, zwpow(pphase(c, yb, zb)));
       }
     for (int r = 0; r < N; r++)                          // M = (S' P_b) S'^dag
       for (int s = 0; s < N; s++) {
         Zw acc{0, 0, 0, 0};
         for (int c = 0; c < N; c++) {
-          const Zw y = S.e[s * N + c];
+          const Zw y = ld(S.e[s * N + c]);
           if (!zzero(y) && !zzero(SP[r * N + c])) acc = zadd(acc, zmul(SP[r * N + c], zconj(y)));
         }
         M[r * N + s] = acc;
@@ -348,46 +373,64 @@ HD inline bool node_less(const Node &x, const Node &y) {      // hash, then lexi
 }
 struct NodeLess { HD bool operator()(const Node &x, const Node &y) const { return node_less(x, y); } };
 
-enum : uint8_t { DEAD = 0, ALIVE = 1, FOUND = 2, W2CUT = 3, W3CUT = 4 };
+enum : uint8_t { DEAD = 0, ALIVE = 1, FOUND = 2, W2CUT = 3, W3CUT = 4, NEEDT = 5, OVF = 6 };
 
-template <int NQ> struct Expand {        // one thread per parent: all its children
+template <int NQ> struct ParentResidual {   // pass 0: S = U p^-1 once per parent
   Spec sp;
   const Node *parents;
-  uint8_t *status;                       // [parent * G + g]
+  Mat<NQ> *R;
+  HD void operator()(int i) const { residual(R[i], sp, parents[i].seq, parents[i].len); }
+};
+
+// pass 1, one thread per child: windows, gate, identity, the cheap bounds (H, structure, support, CX). Children the
+// cheap bound can't prune become NEEDT with (h, c2, support) packed in `cheap` for pass 2.
+template <int NQ> struct Cheap {
+  Spec sp;
+  const Node *parents;
+  const Mat<NQ> *R;
+  uint8_t *status;
+  int *cheap;
   uint64_t *h1, *h2;
-  int t;                                 // child length
-  HD void operator()(int i) const {
+  int t;
+  HD void operator()(int o) const {
+    const int i = o / sp.G, g = o % sp.G;
     const Node &p = parents[i];
-    Mat<NQ> S;
-    residual(S, sp, p.seq, p.len);
-    const int rem = sp.depth - t;
-    for (int g = 0; g < sp.G; g++) {
-      const int o = i * sp.G + g;
-      if (p.len >= 1 && sp.bad2[p.seq[p.len - 1] * sp.G + g]) { status[o] = W2CUT; continue; }
-      if (p.len >= 2) {
-        const uint32_t tri = ((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g;
-        if ((sp.bad3[tri >> 5] >> (tri & 31)) & 1) { status[o] = W3CUT; continue; }
-      }
-      Mat<NQ> C = S;
-      apply_inv(C, sp.gates[g]);
-      if (is_identity(C)) { status[o] = FOUND; h1[o] = h2[o] = 0; continue; }
-      int lb = 0;
-      if (sp.standard) {
-        const int hs = h_struct(C), h = C.k > hs ? C.k : hs;
-        const int supp = support(C), c2 = cx_bound(C, sp);
-        lb = combine(h, 0, c2, supp);
-        if (lb <= rem) lb = combine(h, ptm_sde(C), c2, supp);
-      }
-      if (lb > rem) { status[o] = DEAD; continue; }
-      status[o] = ALIVE;
-      uint64_t a, b;
-      hash2(C, a, b);
-      h1[o] = a; h2[o] = b;
+    if (p.len >= 1 && sp.bad2[p.seq[p.len - 1] * sp.G + g]) { status[o] = W2CUT; return; }
+    if (p.len >= 2) {
+      const uint32_t tri = ((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g;
+      if ((sp.bad3[tri >> 5] >> (tri & 31)) & 1) { status[o] = W3CUT; return; }
     }
+    Mat<NQ> C = R[i];
+    apply_inv(C, sp.gates[g]);
+    if (C.ovf || R[i].ovf) { status[o] = OVF; return; }
+    if (is_identity(C)) { status[o] = FOUND; return; }
+    if (!sp.standard) { status[o] = ALIVE; hash2(C, h1[o], h2[o]); return; }
+    const int hs = h_struct(C), h = C.k > hs ? C.k : hs;
+    const int supp = support(C), c2 = cx_bound(C, sp);
+    if (combine(h, 0, c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
+    status[o] = NEEDT;
+    cheap[o] = h | (c2 << 10) | (supp << 20);
   }
 };
 
-struct IsAlive { const uint8_t *s; HD bool operator()(int o) const { return s[o] == ALIVE; } };
+template <int NQ> struct Full {             // pass 2, on NEEDT children only: T bound (PTM sde), then hash
+  Spec sp;
+  const Mat<NQ> *R;
+  uint8_t *status;
+  const int *cheap;
+  uint64_t *h1, *h2;
+  int t;
+  HD void operator()(int o) const {
+    const int i = o / sp.G, g = o % sp.G;
+    Mat<NQ> C = R[i];
+    apply_inv(C, sp.gates[g]);
+    const int c = cheap[o], h = c & 1023, c2 = (c >> 10) & 1023, supp = c >> 20;
+    if (combine(h, ptm_sde(C), c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
+    status[o] = ALIVE;
+    hash2(C, h1[o], h2[o]);
+  }
+};
+
 struct IsStatus { uint8_t v; HD bool operator()(uint8_t s) const { return s == v; } };
 
 struct MakeChild {
@@ -410,7 +453,7 @@ template <int NQ> struct SameResidual {   // exact: hashes equal and the residua
     residual(A, sp, x.seq, x.len);
     residual(B, sp, y.seq, y.len);
     if (A.k != B.k) return false;
-    for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) if (!zeq(A.e[i], B.e[i])) return false;
+    for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) if (!zeq32(A.e[i], B.e[i])) return false;
     return true;
   }
 };
@@ -501,7 +544,9 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
   thrust::device_vector<Node> frontier(1);
   { Node root{}; frontier[0] = root; }
   {   // depth 0: is the target the identity?
-    Mat<NQ> S; thrust::host_vector<Zw> T(d_target); for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) S.e[i] = T[i]; S.k = hs.tk;
+    Mat<NQ> S; S.ovf = 0; S.k = hs.tk;
+    for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) S.e[i] = st(hs.target[i], S.ovf);
+    if (S.ovf) { std::fprintf(stderr, "target coefficients exceed int32: rebuild with -DSTORE64\n"); return 4; }
     if (is_identity(S)) { std::printf("{\"found\": 0, \"circuit\": []}\n"); return 0; }
   }
   for (int t = 1; t <= depth; t++) {
@@ -512,11 +557,30 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
     std::vector<Node> found;
     for (long off = 0; off < m; off += chunk) {
       const long cm = std::min(chunk, m - off);
-      thrust::device_vector<uint8_t> status(cm * hs.G);
-      thrust::device_vector<uint64_t> h1(cm * hs.G), h2(cm * hs.G);
-      Expand<NQ> ex{sp, thrust::raw_pointer_cast(frontier.data()) + off, thrust::raw_pointer_cast(status.data()),
-                    thrust::raw_pointer_cast(h1.data()), thrust::raw_pointer_cast(h2.data()), t};
-      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)cm), ex);
+      const Node *par = thrust::raw_pointer_cast(frontier.data()) + off;
+      const int nc = (int)(cm * hs.G);
+      thrust::device_vector<Mat<NQ>> R(cm);                            // pass 0
+      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)cm),
+                       ParentResidual<NQ>{sp, par, thrust::raw_pointer_cast(R.data())});
+      thrust::device_vector<uint8_t> status(nc);
+      thrust::device_vector<int> cheap(nc);
+      thrust::device_vector<uint64_t> h1(nc), h2(nc);
+      uint8_t *st_ = thrust::raw_pointer_cast(status.data());
+      uint64_t *h1_ = thrust::raw_pointer_cast(h1.data()), *h2_ = thrust::raw_pointer_cast(h2.data());
+      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc),   // pass 1
+                       Cheap<NQ>{sp, par, thrust::raw_pointer_cast(R.data()), st_, thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t});
+      if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
+        std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
+        return 4;
+      }
+      const long nt = thrust::count(status.begin(), status.end(), (uint8_t)NEEDT);
+      if (nt) {                                                        // pass 2 on the compacted NEEDT children
+        thrust::device_vector<int> idx(nt);
+        thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc), status.begin(),
+                        idx.begin(), IsStatus{NEEDT});
+        thrust::for_each(idx.begin(), idx.end(), Full<NQ>{sp, thrust::raw_pointer_cast(R.data()), st_,
+                                                          thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t});
+      }
       n_w2 += thrust::count(status.begin(), status.end(), (uint8_t)W2CUT);
       n_w3 += thrust::count(status.begin(), status.end(), (uint8_t)W3CUT);
       n_dead += thrust::count(status.begin(), status.end(), (uint8_t)DEAD);
@@ -578,7 +642,7 @@ int main(int argc, char **argv) {
   }
   std::ifstream f(argv[1]);
   HostSpec hs = read_spec(f);
-  int depth = hs.depth; bool dedupe = true; long chunk = 1 << 18;
+  int depth = hs.depth; bool dedupe = true; long chunk = 1 << 17;
   for (int i = 2; i < argc; i++) {
     if (!std::strcmp(argv[i], "--depth") && i + 1 < argc) depth = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-dedupe")) dedupe = false;
