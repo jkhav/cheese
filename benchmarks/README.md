@@ -60,6 +60,9 @@ T-count <= 6, 3 qubits T-count <= 4).
 | 13 | 3 | 14 (7 T + ccx) | - | - | 18 (4 T + 2 ccx) | **8** (improved) | 44 s |
 | 7 | 3 | 14 (2 ccx) | 14 (2 ccx) | - | 14 (2 ccx) | **4** (improved) | 0.4 s |
 
+Each decomposition is stored as `rus/<n>/tcount.json` (format in optimal/README.md; check with
+`python -m cudasynth.tcount verify rus/<n>/spec.qasm rus/<n>/tcount.json`).
+
 The T-count is of the full unitary; a RUS circuit only has to be right on its success branch, so its own optimum
 can be lower. The output is a decomposition into Pauli rotations and a Clifford, not yet an explicit gate list.
 

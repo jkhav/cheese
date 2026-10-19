@@ -1,0 +1,6 @@
+{"dir": "search", "t": 1, "parents": 1, "children": 15, "cosets": 15, "new": 15, "seconds": 0.00}
+{"dir": "search", "t": 2, "parents": 15, "children": 225, "cosets": 180, "new": 180, "seconds": 0.00}
+{"dir": "search", "t": 3, "parents": 180, "children": 2700, "cosets": 1972, "new": 1972, "seconds": 0.00}
+{"dir": "search", "t": 4, "parents": 1972, "children": 29580, "cosets": 20760, "new": 20760, "seconds": 0.01}
+{"dir": "search", "t": 5, "parents": 20760, "children": 311400, "cosets": 214753, "new": 214753, "seconds": 0.05}
+{"tcount": 11, "rotations": [[4, 0], [12, 0], [11, 0], [4, 0], [11, 0], [15, 1], [4, 1], [11, 1], [4, 1], [12, 1], [11, 1]], "split": [5, 6], "seconds": 0.12}

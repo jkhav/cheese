@@ -1,0 +1,4 @@
+{"dir": "search", "t": 1, "parents": 1, "children": 63, "cosets": 63, "new": 63, "seconds": 0.00}
+{"dir": "search", "t": 2, "parents": 63, "children": 3969, "cosets": 2970, "new": 2970, "seconds": 0.01}
+{"dir": "search", "t": 3, "parents": 2970, "children": 187110, "cosets": 130054, "new": 130054, "seconds": 0.67}
+{"tcount": 7, "rotations": [[3, 0], [12, 0], [15, 0], [63, 1], [60, 1], [51, 1], [48, 1]], "split": [3, 4], "seconds": 0.84}
