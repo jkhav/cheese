@@ -5,7 +5,7 @@ prefix whose remaining work provably exceeds the depth budget, and either find a
 the given depth exists. Targets: unitaries, state maps, and repeat-until-success (RUS) circuits without
 measurement. See [docs/PLAN.md](docs/PLAN.md).
 
-Status: early development. How the search and its pruning work: [docs/ALGORITHM.md](docs/ALGORITHM.md).
+Status: early development using AI agents. How the search and its pruning work: [docs/ALGORITHM.md](docs/ALGORITHM.md).
 
 ## Install and build
 
