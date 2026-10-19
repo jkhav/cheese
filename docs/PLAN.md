@@ -88,8 +88,21 @@ Symmetry classes and distance table (2026-10-20; details and soundness in docs/A
   build), K=8 17.9M (30 s); with ccx, K=7 15.9M.
 - RUS 27 budget 14: 64-95 s plain, 34 s classes, 12.2 s K=7, 2.8 s K=8 (table cached).
   RUS 13 budget 16: 214 s plain, 75 s K=7.
-- Fredkin (17-gate Clifford+T input) with `--table 8`: budgets 1..15 proved impossible (previous best proof:
-  9); budget 15 took 10.8 s of search (largest frontier 6.6M). Budget 16 and Toffoli (15-gate input): running.
+- Toffoli (15-gate input): **optimal gate count 15**, every budget <= 14 proved impossible; 27 s in total with
+  `--table 8` (budget 14 1.5 s, budget 15 11.1 s), 282 s without the table (budget 14 47.8 s, 15 212 s).
+- Fredkin (17-gate input): **optimal gate count 17**, every budget <= 16 proved impossible (budget 15 11.3 s,
+  budget 16 91 s with `--table 8`); the input circuit has 17 gates. (Budget 17 itself ran out of GPU memory at
+  level 8, 51M nodes, and is not needed.) Previous best proofs: Toffoli 12, Fredkin 9.
+
+T-count mode (2026-10-20; separate binary, docs/ALGORITHM.md section 10), RTX 3060 Ti, all decompositions
+verified exactly:
+- 3-qubit T-count table (cosets with T-count <= 4): 5,605,741 cosets, built once in 41 s; 2-qubit table
+  (T-count <= 6): 1,728,736 cosets.
+- Toffoli, Fredkin, Peres, CCZ: T-count 7 (known optimum), about 1.0 s each with the cached table (42.5 s for
+  the first, including the table). Di Matteo and Mosca (arXiv:1606.07413): 24-27 s each on 4,096 Blue Gene/Q
+  cores, with no state kept between targets. Relative-phase Toffoli 4, CS 3, QFT_2 3.
+- RUS benchmarks (full unitary): see benchmarks/README.md. Improvements over the benchmark circuits (ccx
+  counted as 7 T): RUS 7 14 -> 4, RUS 13 14 -> 8, RUS 14 12 -> 6.
 
 Not implemented yet (in order):
 1. ~~GPU memory layout~~ (done, above).

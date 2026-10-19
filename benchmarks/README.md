@@ -36,5 +36,32 @@ budgets, "last budget" the one that found the circuit.
 | 27 | 3 | 20 | 14 | 100 s | 71.3 s | Clifford+T |
 | 28 | 2 | 3 | 3 | 2 s | 0.2 s | Clifford+T |
 
+## Results: optimal T-count of the RUS unitaries (cudasynth T-count mode)
+
+`./tcount.sh rus/<n>/spec.qasm`: the fewest T gates of any Clifford+T circuit with exactly the spec's unitary
+(measurements dropped, all branches, global phase ignored), proved optimal and verified exactly. Circuit
+columns count T/Tdg gates, each ccx as 7 (its optimal T-count). RTX 3060 Ti, tables cached (built once: 2 qubits
+T-count <= 6, 3 qubits T-count <= 4).
+
+| RUS | qubits | spec.qasm | synth.qasm | optimal-nm.qasm | unitary-opt.qasm (gate count) | **optimal T-count** | time |
+|---|---|---|---|---|---|---|---|
+| 28 | 2 | 1 | - | - | 1 | **1** | 0.2 s |
+| 2 | 2 | 2 | 2 | - | 2 | **2** | 0.2 s |
+| 12 | 2 | 2 | - | - | 2 | **2** | 0.2 s |
+| 20 | 3 | 2 | - | - | 2 | **2** | 0.4 s |
+| 1 | 2 | 4 | 4 | - | 4 | **4** | 0.2 s |
+| 3 | 2 | 4 | 4 | - | 4 | **4** | 0.2 s |
+| 27 | 3 | 4 | - | - | 4 | **4** | 0.3 s |
+| 8 | 3 | 4 | - | 4 | 4 | **4** (README: best known; now proved optimal) | 0.4 s |
+| 4 | 2 | 6 | - | 6 | 6 | **6** | 0.2 s |
+| 5 | 2 | 11 | - | - | 11 | **11** | 0.3 s |
+| 6 | 2 | 11 | - | - | 11 | **11** | 0.3 s |
+| 14 | 3 | 12 (5 T + ccx) | - | 16 (2 T + 2 ccx) | 16 (2 T + 2 ccx) | **6** (improved) | 0.3 s |
+| 13 | 3 | 14 (7 T + ccx) | - | - | 18 (4 T + 2 ccx) | **8** (improved) | 44 s |
+| 7 | 3 | 14 (2 ccx) | 14 (2 ccx) | - | 14 (2 ccx) | **4** (improved) | 0.4 s |
+
+The T-count is of the full unitary; a RUS circuit only has to be right on its success branch, so its own optimum
+can be lower. The output is a decomposition into Pauli rotations and a Clifford, not yet an explicit gate list.
+
 Not run yet: RUS 9, 21, 22, 23, 25, 26 (4 qubits: need an NQ=4 build) and RUS 10, 11, 15-19, 24 (5-7 qubits:
 not supported by the unitary search).

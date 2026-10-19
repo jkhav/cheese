@@ -272,7 +272,33 @@ changes it by <= 1) and Schmidt ranks across cuts, computed **exactly** with min
 bound: a rank mod p could be too low and overstate the gap to a higher target rank. The GPU binary refuses
 state targets for now.
 
-## 10. What is checked
+## 10. T-count mode (`tcount.sh`, `src/tcount.cu`; separate binary)
+
+A second, independent program finds the optimal **T-count** (T gates only; Cliffords are free; global phase
+ignored), the metric of Gosset, Kliuchnikov, Mosca and Russo and of Di Matteo and Mosca (arXiv:1606.07413).
+
+- Form: every Clifford+T unitary is U = R(P_1) ... R(P_t) C with R(P) = ((1 + w) I + (1 - w) P) / 2 a pi/8
+  rotation about a non-identity Pauli (one T gate each) and C a Clifford; t minimal is the T-count.
+- Representation: the channel matrix Uc[a][b] = Tr(P_a U P_b U^dag) / 2^n (64 x 64 at 3 qubits), entries
+  (x + y sqrt2) / sqrt2^e with one exponent per matrix, exact. Peeling a rotation off the left, S <- R(P)^-1 S,
+  keeps rows that commute with P and replaces an anticommuting row a by (row a - s row r) / sqrt2 with
+  i P P_a = s P_r (checked against direct multiplication for every Pauli on CS, QFT_2 and Toffoli).
+- Cosets: right multiplication by a Clifford permutes columns with signs, so the right coset S C is labelled by
+  e and the multiset of sign-normalised columns (two unitary channels with equal labels differ by a Clifford).
+  Peeling acts on the left, so successors depend only on the coset: deduplicating cosets is exact.
+- Table: every coset with T-count <= K, built from the identity level by level (a coset seen at a lower level is
+  dropped), cached in `build/tcount-table-n<n>-k<K>.bin`; it does not depend on the target.
+- Search: peel rotations off U level by level (deduplicated by coset) and look every residual up. A residual in
+  the table at level c gives T-count j + c, and the first level j with a hit gives the optimum, because a
+  decomposition of T-count t' is hit at level max(0, t' - K). Coset equality is always confirmed exactly
+  (columns sorted by hash, then compared entry by entry); the decomposition is re-checked by independent Python.
+- GPU layout: one 64-thread block per coset, the 64 x 64 matrix in shared memory (64 KB with the comparison
+  buffer), thread per row for peeling and per column for labels, bitonic sort of the columns for comparisons.
+
+Unlike Di Matteo and Mosca's parallel collision search (deterministic walks, distinguished points, nothing kept
+between targets), the table is built once per qubit count and reused by every target.
+
+## 11. What is checked
 
 - `tests/check.sh`: known verdicts (proofs and found optima) with exact verification of every circuit.
 - Every new pruning rule was checked against a run without it: identical verdicts and optimal lengths, and

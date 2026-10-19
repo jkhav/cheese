@@ -32,3 +32,12 @@ Timings: `tests/bench.sh`. Low level: `python3 -m cudasynth.spec T.qasm D > t.sp
 Validated against milq's `prune_probe.py` (identical survivor counts per level, same circuits): CS 4/5,
 Toffoli 7/8/9, CCZ 8. CPU build on a 12-thread laptop: Toffoli 9 in 7.9 s, CCZ 8 in 7.0 s (Python prototype:
 175 s and 163 s on 10 processes; SAT: no proof within its runs); Toffoli 10 in 23 s and Toffoli 11 in 2.5 min.
+
+## T-count mode
+
+    ./build.sh tcount                   # separate binary build/tcount (src/tcount.cu)
+    ./tcount.sh TARGET.qasm             # optimal T-count up to global phase, decomposition verified exactly
+
+Toffoli, Fredkin, Peres, CCZ (T-count 7) take about 1 s each on an RTX 3060 Ti once the 3-qubit coset table
+(41 s, cached in build/) exists. Method in [docs/ALGORITHM.md](docs/ALGORITHM.md) section 10, results in
+docs/PLAN.md and benchmarks/README.md.

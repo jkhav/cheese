@@ -2,6 +2,7 @@
 # Build both backends from the same source (install.sh runs this; it writes build/config.sh first).
 #   ./build.sh cpu    g++ + OpenMP (Thrust's OMP backend): any machine, for development and tests
 #   ./build.sh cuda   nvcc for the GPU
+#   ./build.sh tcount nvcc: the separate T-count binary (build/tcount, src/tcount.cu)
 # Settings (environment, else build/config.sh): NVCC, ARCH (sm_86 RTX 30xx, sm_89 RTX 40xx, sm_120 RTX 50xx;
 # default native), CCCL (Thrust headers dir), CUDA_INC / CUDA_LIB (pip-installed toolkit), NQ="2 3" (qubit-count
 # range compiled in, default "1 4"; nvcc takes minutes per count, so narrow it).
@@ -31,4 +32,11 @@ case "${1:-cpu}" in
       else cat build/nvcc.log >&2; exit 1; fi
     fi
     echo build/cudasynth ;;
+  tcount)
+    FLAGS="-std=c++17 -O3 -arch=$ARCH"
+    [ -n "$CUDA_INC" ] && FLAGS="$FLAGS -I$CUDA_INC"
+    [ -n "$CCCL" ] && FLAGS="$FLAGS -I$CCCL"
+    [ -n "$CUDA_LIB" ] && FLAGS="$FLAGS -L$CUDA_LIB -Xlinker -rpath=$CUDA_LIB"
+    $NVCC $FLAGS src/tcount.cu -o build/tcount
+    echo build/tcount ;;
 esac
