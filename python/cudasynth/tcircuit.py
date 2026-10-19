@@ -6,9 +6,13 @@ circuit has exactly t T gates. The Clifford remainder C is synthesised by Qiskit
 this step). The whole circuit is then checked with exact arithmetic: its unitary equals U up to a global phase
 w^k, as the T-count is defined.
 
-  python -m cudasynth.tcircuit TARGET.qasm DECOMPOSITION.json OUT.qasm
+  python -m cudasynth.tcircuit TARGET.qasm DECOMPOSITION.json OUT.qasm [--opt [BEAM]]
+
+--opt: then minimise the Clifford gates with build/cliffopt (src/clifford.cu): every Clifford segment between
+two T gates replaced by an optimal one from a GPU table of the whole Clifford group, and the T gates moved
+(through Cliffords that commute with them) to make the sum small. The result is checked exactly again.
 """
-import json, sys
+import json, os, subprocess, sys, tempfile
 
 from .spec import parse_qasm, unitary, mul, wpow
 from .tcount import rot, matmul, dagger
@@ -62,6 +66,37 @@ def build(n, U, rotations):
     return gates
 
 
+def optimise(n, gates, beam=16):
+    """same T gates, minimal Clifford segments and a beam-searched placement of the T gates (build/cliffopt)"""
+    tq, segs, cur = [], [], []
+    for g, qs in gates:
+        if g in ("t", "tdg"):
+            tq.append((qs[0], int(g == "tdg")))
+            segs.append(cur)
+            cur = []
+        else:
+            cur.append((g, qs))
+    segs.append(cur)
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    with tempfile.NamedTemporaryFile("w", suffix=".job", delete=False) as f:
+        f.write(f"{n} {len(tq)}\n" + "".join(f"{q} {d}\n" for q, d in tq))
+        for sg in segs:
+            f.write(f"{len(sg)} " + " ".join(f"{g} " + " ".join(map(str, qs)) for g, qs in sg) + "\n")
+        job = f.name
+    try:
+        res = subprocess.run([os.path.join(root, "build", "cliffopt"), job, "--beam", str(beam)],
+                             capture_output=True, text=True, check=True)
+    finally:
+        os.unlink(job)
+    lines = res.stdout.splitlines()
+    info = json.loads(lines[0])
+    out = []
+    for l in lines[1:]:
+        g, *qs = l.split()
+        out.append((g, tuple(int(q) for q in qs)))
+    return out, info
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
@@ -70,6 +105,13 @@ def main():
     U = unitary(n, circ)
     res = json.loads(next(l for l in open(sys.argv[2]) if '"rotations"' in l))
     gates = build(n, U, res["rotations"])
+    if "--opt" in sys.argv:
+        i = sys.argv.index("--opt")
+        beam = int(sys.argv[i + 1]) if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit() else 16
+        before = len(gates)
+        gates, info = optimise(n, gates, beam)
+        print(f"cliffopt: Clifford gates {info['clifford_gates_before']} -> {info['clifford_gates']}, "
+              f"total {before} -> {len(gates)} ({info['seconds']} s)")
     tc = sum(g in ("t", "tdg") for g, _ in gates)
     ok = equal_up_to_phase(unitary(n, gates), U) and tc == res["tcount"]
     print(f"{'verified' if ok else 'NOT EQUIVALENT'}: {len(gates)} gates, T-count {tc}, equal to the target up to global phase")

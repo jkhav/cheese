@@ -300,6 +300,16 @@ with V a CNOT ladder (Z_q -> Z on P's support) followed by H (X) or S H (Y) on e
 every Pauli; the Clifford remainder is synthesised by Qiskit; the whole circuit is checked exactly against U up
 to a phase w^k.
 
+Fewer Clifford gates (`--opt`, `src/clifford.cu`, binary `build/cliffopt`): the circuit is cut at its T gates
+into Clifford segments D_0 T D_1 ... T D_t. A breadth-first search over the whole n-qubit Clifford group on the
+GPU (92,897,280 tableaux for n = 3, each packed into 64 bits, in a GPU hash table; the count is checked against
+the group order) gives the minimal gate count of every Clifford over H, S, Sdg, X, Z, CX, and an optimal circuit
+by walking the counts down. The T gates are then re-placed: T_q commutes with every Clifford K that fixes Z_q,
+so K T' K^-1 with K Z_q' K^-1 = +-Z_q (T' on q', dagger flipped for the minus sign) leaves the circuit unchanged
+up to phase, and T = Tdg S, Tdg = T Sdg let a dagger flip move an S into the segment before. A beam search over
+all these choices (about 8.8M per T gate at 3 qubits) minimises the summed optimal segment lengths. This gives
+optimal segments and a good placement, not a proof of the fewest total gates (docs/PLAN.md item 6).
+
 Unlike Di Matteo and Mosca's parallel collision search (deterministic walks, distinguished points, nothing kept
 between targets), the table is built once per qubit count and reused by every target.
 

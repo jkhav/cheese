@@ -101,6 +101,10 @@ verified exactly:
 - Toffoli, Fredkin, Peres, CCZ: T-count 7 (known optimum), about 1.0 s each with the cached table (42.5 s for
   the first, including the table). Di Matteo and Mosca (arXiv:1606.07413): 24-27 s each on 4,096 Blue Gene/Q
   cores, with no state kept between targets. Relative-phase Toffoli 4, CS 3, QFT_2 3.
+- Explicit circuits with Cliffords reduced by `cliffopt` (GPU Clifford-group table + beam search over T
+  placement): Toffoli 20 gates, Fredkin 21, Peres 15, CCZ 16, CS 5 and QFT_2 7 (both = the gate-count optimum),
+  all at optimal T-count; RUS circuits in benchmarks/README.md. Clifford table for 3 qubits: 92,897,280 elements,
+  about 3 s on the GPU.
 - RUS benchmarks (full unitary): see benchmarks/README.md. Improvements over the benchmark circuits (ccx
   counted as 7 T): RUS 7 14 -> 4, RUS 13 14 -> 8, RUS 14 12 -> 6.
 
@@ -110,6 +114,11 @@ Not implemented yet (in order):
 3. Global-phase mode.
 4. ~~Meet-in-the-middle~~ (done, above; next: choose the split level by frontier size, partition the join).
 5. Multi-GPU / cluster split (phase 4).
+6. Fewest total gates at optimal T-count, exactly: the gate-count search with a T-count cap (prune a prefix when
+   its T gates plus the T lower bound of its residual exceed the optimal T-count). Proves the minimal total among
+   circuits with optimal T-count; feasible where the gate-count search reaches (Toffoli, Fredkin, CCZ, RUS up to
+   ~18 gates), not for RUS 13/14. Until then `cliffopt` gives optimal Clifford segments and a beam-searched
+   placement of the T gates, which is not a proof of the minimal total.
 
 Each extra depth costs ~6-7x the work (Toffoli 10 -> 11).
 

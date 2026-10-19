@@ -11,5 +11,8 @@
 - `<name>-tcount.qasm`: the same decompositions as explicit Clifford+T circuits with exactly that many T/Tdg
   gates, equal to the target up to global phase (checked exactly). Built by
   `python -m cudasynth.tcircuit TARGET.qasm DECOMPOSITION.json OUT.qasm`: each rotation is V T V^dag with a
-  Clifford V (CNOT ladder + H / S H), the Clifford remainder is synthesised with Qiskit. Only the T-count is
-  optimal; the Clifford gates are not minimised.
+  Clifford V (CNOT ladder + H / S H), the Clifford remainder is synthesised with Qiskit. Then the Clifford gates are
+  reduced by `--opt` (build/cliffopt: optimal Clifford segments from a GPU table of the whole Clifford group and
+  a beam search over where the T gates sit). The T-count is optimal; the total is small but not proved minimal.
+  Total gates before -> after `--opt`: Toffoli 28 -> 20, Fredkin 67 -> 21, Peres 28 -> 15, CCZ 24 -> 16,
+  relative-phase Toffoli 29 -> 12, CS 7 -> 5 (= the gate-count optimum), QFT_2 14 -> 7 (= the gate-count optimum).
