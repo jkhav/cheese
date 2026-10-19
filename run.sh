@@ -6,14 +6,15 @@
 #   ./run.sh TARGET.qasm --depth 9        one budget: a circuit of <= 9 gates, or a proof that none exists
 #   ./run.sh TARGET.qasm --ancilla 2      state target (RUS without measurement): qubit 2 starts in |0>, the circuit
 #                                         must map every |x,0> to TARGET|x,0> exactly; --inputs 0,3,5 lists inputs
-#   options: --out FILE.qasm (default results/<name>-opt.qasm), --cpu (CPU binary), --no-dedupe, --chunk N
+#   options: --out FILE.qasm (default results/<name>-opt.qasm), --cpu (CPU binary), --no-dedupe, --chunk N,
+#            --mitm (meet in the middle: forward to level ceil(D/2), backward on U^dag, exact join; unitaries only)
 #
 # A budget that fails is a proof (no circuit of <= that many gates). One run with budget D returns the shortest
 # circuit of <= D gates, but small budgets prune far harder, hence the increasing loop. Each budget's per-level
 # JSON goes to results/<name>-d<D>.log; found circuits are re-checked exactly (python -m cudasynth.verify).
 set -e
 cd "$(dirname "$0")"
-[ $# -ge 1 ] || { sed -n '2,15p' "$0"; exit 1; }
+[ $# -ge 1 ] || { sed -n '2,16p' "$0"; exit 1; }
 TARGET=$(realpath "$1"); shift
 NAME=$(basename "$TARGET" .qasm)
 FROM=1; ONLY=; OUT=results/$NAME-opt.qasm; BIN=; PASS=; ST=
@@ -24,6 +25,7 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift ;;
     --cpu) BIN=build/cudasynth-cpu ;;
     --no-dedupe) PASS="$PASS --no-dedupe" ;;
+    --mitm) PASS="$PASS --mitm" ;;
     --chunk) PASS="$PASS --chunk $2"; shift ;;
     --ancilla) ST="--ancilla $2"; shift; while [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; do ST="$ST $2"; shift; done ;;
     --inputs) ST="--inputs $2"; shift ;;

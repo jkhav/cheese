@@ -14,7 +14,10 @@
 #include <thrust/count.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
+#include <thrust/binary_search.h>
+#include <thrust/find.h>
 #include <thrust/for_each.h>
+#include <thrust/functional.h>
 #include <thrust/host_vector.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sort.h>
@@ -566,33 +569,64 @@ HD inline int combine(int h, int t, int c2, int supp) {
 }
 
 // ---------------- frontier ----------------
-struct Node {
-  uint64_t h1, h2;
-  uint8_t len, seq[DMAX];
+// The frontier is a tree: level l keeps, per node, its parent's index in level l-1 and its last gate (5 bytes);
+// a prefix is read back by walking up. Children are generated parent-major, gate-minor, so with parents in
+// lexicographic order every level is in lexicographic order too, and a node's index orders it.
+struct Hist {
+  const uint32_t *par[DMAX + 1];
+  const uint8_t *gat[DMAX + 1];
 };
-
-HD inline bool node_less(const Node &x, const Node &y) {      // hash, then lexicographic prefix
-  if (x.h1 != y.h1) return x.h1 < y.h1;
-  if (x.h2 != y.h2) return x.h2 < y.h2;
-  for (int i = 0; i < x.len && i < y.len; i++) if (x.seq[i] != y.seq[i]) return x.seq[i] < y.seq[i];
-  return x.len < y.len;
+HD inline int path(const Hist &H, int t, uint32_t i, uint8_t *seq) {
+  for (int l = t; l >= 1; l--) { seq[l - 1] = H.gat[l][i]; i = H.par[l][i]; }
+  return t;
 }
-struct NodeLess { HD bool operator()(const Node &x, const Node &y) const { return node_less(x, y); } };
+HD inline void last2(const Hist &H, int tp, uint32_t pi, int &g1, int &g2) {   // the parent's last two gates
+  g1 = tp >= 1 ? H.gat[tp][pi] : -1;
+  g2 = tp >= 2 ? H.gat[tp - 1][H.par[tp][pi]] : -1;
+}
+HD inline bool window_cut(const Spec &sp, int g1, int g2, int g, uint8_t &s) {
+  if (g1 >= 0 && sp.bad2[g1 * sp.G + g]) { s = 3; return true; }
+  if (g2 >= 0) {
+    const uint32_t tri = ((uint32_t)g2 * sp.G + g1) * sp.G + g;
+    if ((sp.bad3[tri >> 5] >> (tri & 31)) & 1) { s = 4; return true; }
+  }
+  return false;
+}
+struct Key { uint64_t h1, h2; uint32_t idx; };
+struct KeyLess {        // hash only
+  HD bool operator()(const Key &x, const Key &y) const { return x.h1 != y.h1 ? x.h1 < y.h1 : x.h2 < y.h2; }
+};
+struct KeyLessIdx {     // hash, then index (= lexicographic prefix order)
+  HD bool operator()(const Key &x, const Key &y) const {
+    if (x.h1 != y.h1) return x.h1 < y.h1;
+    if (x.h2 != y.h2) return x.h2 < y.h2;
+    return x.idx < y.idx;
+  }
+};
+struct KeyByIdx { HD bool operator()(const Key &x, const Key &y) const { return x.idx < y.idx; } };
 
 enum : uint8_t { DEAD = 0, ALIVE = 1, FOUND = 2, W2CUT = 3, W3CUT = 4, NEEDT = 5, OVF = 6 };
 
 template <int NQ> struct ParentResidual {   // pass 0: S = U p^-1 once per parent
   Spec sp;
-  const Node *parents;
+  Hist H;
+  int tp;
+  uint32_t off;
   Mat<NQ> *R;
-  HD void operator()(int i) const { residual(R[i], sp, parents[i].seq, parents[i].len); }
+  HD void operator()(int i) const {
+    uint8_t seq[DMAX];
+    const int len = path(H, tp, off + i, seq);
+    residual(R[i], sp, seq, len);
+  }
 };
 
 // pass 1, one thread per child: windows, gate, identity, the cheap bounds (H, structure, support, CX). Children the
 // cheap bound can't prune become NEEDT with (h, c2, support) packed in `cheap` for pass 2.
 template <int NQ> struct Cheap {
   Spec sp;
-  const Node *parents;
+  Hist H;
+  int tp;
+  uint32_t off;
   const Mat<NQ> *R;
   uint8_t *status;
   int *cheap;
@@ -600,12 +634,10 @@ template <int NQ> struct Cheap {
   int t;
   HD void operator()(int o) const {
     const int i = o / sp.G, g = o % sp.G;
-    const Node &p = parents[i];
-    if (p.len >= 1 && sp.bad2[p.seq[p.len - 1] * sp.G + g]) { status[o] = W2CUT; return; }
-    if (p.len >= 2) {
-      const uint32_t tri = ((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g;
-      if ((sp.bad3[tri >> 5] >> (tri & 31)) & 1) { status[o] = W3CUT; return; }
-    }
+    int g1, g2;
+    last2(H, tp, off + i, g1, g2);
+    uint8_t wc;
+    if (window_cut(sp, g1, g2, g, wc)) { status[o] = wc; return; }
     Mat<NQ> C = R[i];
     apply_inv(C, sp.gates[g]);
     if (C.ovf || R[i].ovf) { status[o] = OVF; return; }
@@ -887,7 +919,7 @@ template <int NQ> __device__ int warp_state_t(const Zw32 *S, const Spec &sp, int
 
 // one level, fused: one warp per child does windows, child residual, identity, cheap bounds, T bound, hash
 template <int NQ, bool ST> __global__ void __launch_bounds__(32 * WPB)
-level_warp(Spec sp, const Node *parents, const Mat<NQ> *R, long nc, uint8_t *status, uint64_t *h1, uint64_t *h2, int t) {
+level_warp(Spec sp, Hist H, int tp, uint32_t off, const Mat<NQ> *R, long nc, uint8_t *status, uint64_t *h1, uint64_t *h2, int t) {
   constexpr int N = 1 << NQ, E = N * N;
   __shared__ Zw32 shS[WPB][E];
   __shared__ uint32_t shM[WPB][E], shF[WPB][16];
@@ -895,11 +927,10 @@ level_warp(Spec sp, const Node *parents, const Mat<NQ> *R, long nc, uint8_t *sta
   Zw32 *S = shS[w];
   for (long o = (long)blockIdx.x * WPB + w; o < nc; o += (long)gridDim.x * WPB) {
     const int i = (int)(o / sp.G), g = (int)(o % sp.G);
-    const Node &p = parents[i];
+    int g1, g2;
+    last2(H, tp, off + i, g1, g2);
     uint8_t s;
-    if (p.len >= 1 && sp.bad2[p.seq[p.len - 1] * sp.G + g]) s = W2CUT;
-    else if (p.len >= 2 && ((sp.bad3[(((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g) >> 5] >>
-                             ((((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g) & 31)) & 1)) s = W3CUT;
+    if (window_cut(sp, g1, g2, g, s)) {}
     else {
       bool ovf;
       const int k = warp_child<NQ>(S, R[i], sp.gates[g], lane, ovf);
@@ -951,28 +982,70 @@ static void cuda_check(const char *what) {
 
 struct IsStatus { uint8_t v; HD bool operator()(uint8_t s) const { return s == v; } };
 
-struct MakeChild {
-  const Node *parents;
-  const uint64_t *h1, *h2;
+struct Emit {            // alive child o of the chunk -> parent, gate, key (index base + j)
+  const int *idx;
+  uint32_t off, base;
   int G;
-  HD Node operator()(int o) const {
-    Node c = parents[o / G];
-    c.seq[c.len++] = (uint8_t)(o % G);
-    c.h1 = h1[o]; c.h2 = h2[o];
-    return c;
+  const uint64_t *h1, *h2;
+  uint32_t *CP;
+  uint8_t *CG;
+  Key *CK;
+  HD void operator()(int j) const {
+    const int o = idx[j];
+    CP[base + j] = off + o / G; CG[base + j] = (uint8_t)(o % G);
+    CK[base + j] = Key{h1[o], h2[o], base + j};
   }
 };
 
-template <int NQ> struct SameResidual {   // exact: hashes equal and the residual matrices equal
+template <int NQ> struct SameChild {   // exact: hashes equal and the residual matrices equal
   Spec sp;
-  HD bool operator()(const Node &x, const Node &y) const {
+  Hist H;
+  int tp;
+  const uint32_t *CP;
+  const uint8_t *CG;
+  HD void child(uint32_t c, Mat<NQ> &A) const {
+    uint8_t seq[DMAX];
+    const int len = path(H, tp, CP[c], seq);
+    seq[len] = CG[c];
+    residual(A, sp, seq, len + 1);
+  }
+  HD bool operator()(const Key &x, const Key &y) const {
     if (x.h1 != y.h1 || x.h2 != y.h2) return false;
     Mat<NQ> A, B;
-    residual(A, sp, x.seq, x.len);
-    residual(B, sp, y.seq, y.len);
+    child(x.idx, A);
+    child(y.idx, B);
     if (A.k != B.k) return false;
     for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) if (!zeq32(A.e[i], B.e[i])) return false;
     return true;
+  }
+};
+
+struct Gather {          // kept keys -> the new level's parent / gate arrays and hashes
+  const Key *K;
+  const uint32_t *CP;
+  const uint8_t *CG;
+  uint32_t *P;
+  uint8_t *Gt;
+  uint64_t *F1, *F2;
+  HD void operator()(int j) const { const uint32_t i = K[j].idx; P[j] = CP[i]; Gt[j] = CG[i]; F1[j] = K[j].h1; F2[j] = K[j].h2; }
+};
+
+struct Tree {            // host handle of the search tree; level 0 is the empty prefix
+  std::vector<thrust::device_vector<uint32_t>> P;
+  std::vector<thrust::device_vector<uint8_t>> Gt;
+  std::vector<long> n;
+  thrust::device_vector<uint64_t> F1, F2;   // hashes of the top level's residuals
+  Tree() : P(1), Gt(1), n(1, 1) {}
+  int top() const { return (int)n.size() - 1; }
+  Hist hist() const {
+    Hist H{};
+    for (int l = 1; l <= top(); l++) { H.par[l] = thrust::raw_pointer_cast(P[l].data()); H.gat[l] = thrust::raw_pointer_cast(Gt[l].data()); }
+    return H;
+  }
+  std::vector<int> seq(int t, uint32_t i) const {
+    std::vector<int> s(t);
+    for (int l = t; l >= 1; l--) { s[l - 1] = Gt[l][i]; i = P[l][i]; }
+    return s;
   }
 };
 
@@ -1090,7 +1163,281 @@ static void prof_report() {
   for (int i = 0; i < 8; i++) if (g_pn[i][0]) std::fprintf(stderr, "  %-9s %.3f s\n", g_pn[i], g_pt[i]);
 }
 
-template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, long chunk) {
+// levels 1..stop of the search on sp's target, pruned against budget depth, growing tree T. 0: a circuit
+// (found_out, the lexicographically first at its level), 1: proof, 2: stopped at level stop (T.top() == stop)
+template <int NQ> static int levels(const HostSpec &hs, const Spec &sp, int depth, int stop, bool dedupe, long chunk,
+                                    Tree &T, std::vector<int> &found_out, long &n_found_out, const char *tag) {
+  for (int t = T.top() + 1; t <= stop; t++) {
+    const double t0 = now();
+    const int tp = t - 1;
+    const long m = T.n[tp];
+    const Hist H = T.hist();
+    const bool keep = t < depth;                       // last level: survivors are never expanded
+    thrust::device_vector<uint32_t> CP;
+    thrust::device_vector<uint8_t> CG;
+    thrust::device_vector<Key> CK;
+    long n_w2 = 0, n_w3 = 0, n_dead = 0, n_alive = 0, n_found = 0;
+    std::vector<int> fseq;
+    for (long off = 0; off < m; off += chunk) {
+      const long cm = std::min(chunk, m - off);
+      const int nc = (int)(cm * hs.G);
+      thrust::device_vector<Mat<NQ>> R(cm);                            // pass 0
+      { Pass p_(0);
+      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)cm),
+                       ParentResidual<NQ>{sp, H, tp, (uint32_t)off, thrust::raw_pointer_cast(R.data())}); }
+      thrust::device_vector<uint8_t> status(nc);
+      thrust::device_vector<uint64_t> h1(nc), h2(nc);
+      uint8_t *st_ = thrust::raw_pointer_cast(status.data());
+      uint64_t *h1_ = thrust::raw_pointer_cast(h1.data()), *h2_ = thrust::raw_pointer_cast(h2.data());
+#ifdef __CUDACC__
+      {   // passes 1 + 2 fused, one warp per child
+        Pass p_(1);
+        const long blocks = std::min(((long)nc + WPB - 1) / WPB, 65535L * 4);
+        if (sp.states) level_warp<NQ, true><<<(unsigned)blocks, 32 * WPB>>>(sp, H, tp, (uint32_t)off, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
+        else level_warp<NQ, false><<<(unsigned)blocks, 32 * WPB>>>(sp, H, tp, (uint32_t)off, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
+        cuda_check("level kernel");
+      }
+      if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
+        std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
+        return 4;
+      }
+#else
+      thrust::device_vector<int> cheap(nc);
+      { Pass p_(1);
+      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc),   // pass 1
+                       Cheap<NQ>{sp, H, tp, (uint32_t)off, thrust::raw_pointer_cast(R.data()), st_, thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t}); }
+      if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
+        std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
+        return 4;
+      }
+      const long nt = thrust::count(status.begin(), status.end(), (uint8_t)NEEDT);
+      if (nt) {                                                        // pass 2 on the compacted NEEDT children
+        Pass p_(2);
+        thrust::device_vector<int> idx(nt);
+        thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc), status.begin(),
+                        idx.begin(), IsStatus{NEEDT});
+        thrust::for_each(idx.begin(), idx.end(), Full<NQ>{sp, thrust::raw_pointer_cast(R.data()), st_,
+                                                          thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t});
+      }
+#endif
+      Pass p_(3);
+      n_w2 += thrust::count(status.begin(), status.end(), (uint8_t)W2CUT);
+      n_w3 += thrust::count(status.begin(), status.end(), (uint8_t)W3CUT);
+      n_dead += thrust::count(status.begin(), status.end(), (uint8_t)DEAD);
+      const long nf = thrust::count(status.begin(), status.end(), (uint8_t)FOUND);
+      if (nf) {
+        if (fseq.empty()) {                            // first in generation order = lexicographically first
+          const int o = (int)(thrust::find(status.begin(), status.end(), (uint8_t)FOUND) - status.begin());
+          fseq = T.seq(tp, (uint32_t)(off + o / hs.G));
+          fseq.push_back(o % hs.G);
+        }
+        n_found += nf;
+      }
+      const long na = thrust::count(status.begin(), status.end(), (uint8_t)ALIVE);
+      n_alive += na;
+      if (na && fseq.empty() && keep) {
+        thrust::device_vector<int> idx(na);
+        thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc), status.begin(),
+                        idx.begin(), IsStatus{ALIVE});
+        const uint32_t base = (uint32_t)CK.size();
+        CP.resize(base + na); CG.resize(base + na); CK.resize(base + na);
+        thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)na),
+                         Emit{thrust::raw_pointer_cast(idx.data()), (uint32_t)off, base, hs.G, h1_, h2_,
+                              thrust::raw_pointer_cast(CP.data()), thrust::raw_pointer_cast(CG.data()),
+                              thrust::raw_pointer_cast(CK.data())});
+      }
+    }
+    if (!fseq.empty()) { found_out = fseq; n_found_out = n_found; return 0; }
+    long distinct = (long)CK.size();
+    if (dedupe && distinct > 1) {
+      Pass p_(4);
+      thrust::sort(CK.begin(), CK.end(), KeyLessIdx{});
+      auto end = thrust::unique(CK.begin(), CK.end(), SameChild<NQ>{sp, H, tp, thrust::raw_pointer_cast(CP.data()),
+                                                                   thrust::raw_pointer_cast(CG.data())});
+      CK.erase(end, CK.end());
+      thrust::sort(CK.begin(), CK.end(), KeyByIdx{});
+      distinct = (long)CK.size();
+    }
+    std::printf("{%s\"t\": %d, \"parents\": %ld, \"prefixes\": %ld, \"cut_w3\": %ld, \"cut_lb\": %ld, \"survivors\": %ld, "
+                "\"distinct\": %ld, \"proved_unsat\": %s, \"seconds\": %.2f}\n",
+                tag, t, m, m * hs.G - n_w2, n_w3, n_dead, n_alive, distinct, distinct ? "false" : "true", now() - t0);
+    std::fflush(stdout);
+    // a proof: nothing survives, or the last level was checked (every prefix of <= depth gates compared to the goal)
+    if (!distinct) return 1;
+    T.P.emplace_back(distinct); T.Gt.emplace_back(distinct); T.n.push_back(distinct);
+    T.F1.resize(distinct); T.F2.resize(distinct);
+    thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)distinct),
+                     Gather{thrust::raw_pointer_cast(CK.data()), thrust::raw_pointer_cast(CP.data()),
+                            thrust::raw_pointer_cast(CG.data()), thrust::raw_pointer_cast(T.P.back().data()),
+                            thrust::raw_pointer_cast(T.Gt.back().data()), thrust::raw_pointer_cast(T.F1.data()),
+                            thrust::raw_pointer_cast(T.F2.data())});
+  }
+  return 2;
+}
+
+// ---------------- meet in the middle ----------------
+// Budget D = a + b. Forward: the search on U, pruned against D, up to level a: residuals R = U p^-1. Backward: the
+// same search on U^dag, levels 1..b: a node q is a suffix s reversed and inverted (q = s^-1), its residual
+// R' = U^dag q^-1 = U^dag s. A circuit p then s of length a + |q| exists iff R = U R' for some pair (s = U p^-1).
+// Circuits shorter than a are found by the forward levels themselves. Every circuit of <= D gates has a
+// canonical prefix and suffix in the two trees (windows, bounds and dedupe are sound on both sides), so no match
+// is a proof. The backward tree itself is the backward table.
+struct IsTrue { HD bool operator()(bool b) const { return b; } };
+struct FwdKey {
+  const uint64_t *F1, *F2;
+  HD Key operator()(int i) const { return {F1[i], F2[i], (uint32_t)i}; }
+};
+template <int NQ> HD inline void mul_left(const Zw *U, int ku, const Mat<NQ> &R, Mat<NQ> &K) {   // K = U R
+  constexpr int N = 1 << NQ;
+  K.ovf = R.ovf; K.k = ku + R.k;
+  for (int r = 0; r < N; r++)
+    for (int c = 0; c < N; c++) {
+      Zw acc{0, 0, 0, 0};
+      for (int m = 0; m < N; m++) {
+        const Zw u = U[r * N + m];
+        if (!zzero(u)) acc = zadd(acc, zmul(u, ld(R.e[m * N + c])));
+      }
+      K.e[r * N + c] = st(acc, K.ovf);
+    }
+  normalise(K);
+}
+template <int NQ> struct BwdKey {    // flat index over backward levels 1..top -> hash of U R'
+  Spec spB;
+  Hist H;
+  long off[DMAX + 2];
+  int top;
+  const Zw *U;
+  int ku;
+  int *ovf;
+  HD Key operator()(long j) const {
+    int l = 1;
+    while (l < top && j >= off[l + 1]) l++;
+    uint8_t seq[DMAX];
+    const int len = path(H, l, (uint32_t)(j - off[l]), seq);
+    Mat<NQ> R, K;
+    residual(R, spB, seq, len);
+    mul_left(U, ku, R, K);
+    if (K.ovf) *ovf = 1;
+    Key key{0, 0, (uint32_t)j};
+    hash2(K, key.h1, key.h2);
+    return key;
+  }
+};
+
+static std::vector<int> inverse_gates(const HostSpec &hs) {   // candidate index of each gate's inverse
+  std::vector<int> inv(hs.G, -1);
+  for (int g = 0; g < hs.G; g++) {
+    std::string nm = hs.names[g];
+    const size_t a = nm.find('_'), b = nm.find('_', a + 1);
+    std::string gate = nm.substr(a + 1, b - a - 1);
+    const char *pairs[4][2] = {{"t", "tdg"}, {"tdg", "t"}, {"s", "sdg"}, {"sdg", "s"}};
+    for (auto &pr : pairs) if (gate == pr[0]) { gate = pr[1]; break; }
+    const std::string want = nm.substr(0, a + 1) + gate + nm.substr(b);
+    for (int h = 0; h < hs.G; h++) if (hs.names[h] == want) inv[g] = h;
+    if (inv[g] < 0) { std::fprintf(stderr, "--mitm: no inverse candidate for %s\n", nm.c_str()); std::exit(3); }
+  }
+  return inv;
+}
+
+static void print_circuit(const HostSpec &hs, const std::vector<int> &c, long n_found, const char *extra, double t0) {
+  std::printf("{\"t\": %d, \"found\": %ld, \"circuit\": [", (int)c.size(), n_found ? n_found : 1L);
+  for (size_t i = 0; i < c.size(); i++) std::printf("%s\"%s\"", i ? ", " : "", hs.names[c[i]].c_str());
+  std::printf("]%s, \"seconds\": %.2f}\n", extra, now() - t0);
+}
+
+template <int NQ> static int mitm_join(const HostSpec &hs, const Spec &sp, int depth, bool dedupe, long chunk,
+                                       const thrust::device_vector<Zw> &d_U, double t0) {
+  constexpr int N = 1 << NQ;
+  if (hs.states) { std::fprintf(stderr, "--mitm: unitary targets only\n"); return 3; }
+  const std::vector<int> inv = inverse_gates(hs);
+  const int a = (depth + 1) / 2, b = depth - a;
+  std::vector<int> found;
+  long n_found = 0;
+  Tree TF;
+  int rc = levels<NQ>(hs, sp, depth, a, dedupe, chunk, TF, found, n_found, "\"dir\": \"fwd\", ");
+  if (rc == 0) { print_circuit(hs, found, n_found, "", t0); return 0; }
+  if (rc != 2) return rc;
+
+  std::vector<Zw> Ud(N * N);                                   // U^dag, same sqrt2 exponent
+  for (int r = 0; r < N; r++) for (int c = 0; c < N; c++) Ud[r * N + c] = zconj(hs.target[c * N + r]);
+  thrust::device_vector<Zw> d_Ud(Ud.begin(), Ud.end());
+  Spec spB = sp;
+  spB.target = thrust::raw_pointer_cast(d_Ud.data());
+  Tree TB;
+  n_found = 0;
+  rc = b ? levels<NQ>(hs, spB, depth, b, dedupe, chunk, TB, found, n_found, "\"dir\": \"bwd\", ") : 2;
+  if (rc == 0) {                                               // a circuit q for U^dag: U = q^-1
+    std::vector<int> c;
+    for (int i = (int)found.size() - 1; i >= 0; i--) c.push_back(inv[found[i]]);
+    print_circuit(hs, c, n_found, "", t0);
+    return 0;
+  }
+  if (rc == 4) return 4;                                       // rc 1: backward died; its stored levels still count
+
+  const double tj = now();
+  const long nf = TF.n[a];
+  const int top = TB.top();
+  BwdKey<NQ> bk{spB, TB.hist(), {}, top, thrust::raw_pointer_cast(d_U.data()), hs.tk, nullptr};
+  long nb = 0;
+  for (int l = 1; l <= top; l++) { bk.off[l] = nb; nb += TB.n[l]; }
+  bk.off[top + 1] = nb;
+  if (!nb) { std::printf("{\"depth\": %d, \"proved_unsat\": true, \"mitm\": [%d, %d]}\n", depth, a, b); return 1; }
+  thrust::device_vector<Key> FK(nf), BK(nb);
+  thrust::transform(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)nf), FK.begin(),
+                    FwdKey{thrust::raw_pointer_cast(TF.F1.data()), thrust::raw_pointer_cast(TF.F2.data())});
+  thrust::sort(FK.begin(), FK.end(), KeyLess{});
+  thrust::device_vector<int> d_ovf(1, 0);
+  bk.ovf = thrust::raw_pointer_cast(d_ovf.data());
+  thrust::transform(thrust::counting_iterator<long>(0), thrust::counting_iterator<long>(nb), BK.begin(), bk);
+  if (d_ovf[0]) { std::fprintf(stderr, "--mitm: coefficients exceed the storage type: rebuild with -DSTORE64\n"); return 4; }
+  thrust::device_vector<bool> hit(nb);
+  thrust::binary_search(FK.begin(), FK.end(), BK.begin(), BK.end(), hit.begin(), KeyLess{});
+  const long nh = thrust::count(hit.begin(), hit.end(), true);
+  std::printf("{\"dir\": \"join\", \"forward\": %ld, \"backward\": %ld, \"hash_matches\": %ld, \"seconds\": %.2f}\n",
+              nf, nb, nh, now() - tj);
+  std::fflush(stdout);
+  if (nh) {                                                    // confirm candidates exactly on the host
+    thrust::device_vector<Key> HB(nh);
+    thrust::copy_if(BK.begin(), BK.end(), hit.begin(), HB.begin(), IsTrue{});
+    thrust::device_vector<int> pos(nh);
+    thrust::lower_bound(FK.begin(), FK.end(), HB.begin(), HB.end(), pos.begin(), KeyLess{});
+    thrust::host_vector<Key> hb(HB);
+    thrust::host_vector<int> hp(pos);
+    Spec hF = sp, hB = sp;                                     // host copies for residual()
+    hF.gates = hs.gates.data(); hF.target = hs.target.data();
+    hB.gates = hs.gates.data(); hB.target = Ud.data();
+    for (long j = 0; j < nh; j++) {
+      const long fj = hb[j].idx;
+      int l = 1;
+      while (l < top && fj >= bk.off[l + 1]) l++;
+      const std::vector<int> q = TB.seq(l, (uint32_t)(fj - bk.off[l]));
+      std::vector<uint8_t> q8(q.begin(), q.end());
+      Mat<NQ> Rq, K;
+      residual(Rq, hB, q8.data(), (int)q8.size());
+      mul_left(hs.target.data(), hs.tk, Rq, K);
+      for (long f = hp[j]; f < nf; f++) {
+        const Key fk = FK[f];
+        if (fk.h1 != hb[j].h1 || fk.h2 != hb[j].h2) break;
+        std::vector<int> c = TF.seq(a, fk.idx);
+        std::vector<uint8_t> p8(c.begin(), c.end());
+        Mat<NQ> R;
+        residual(R, hF, p8.data(), (int)p8.size());
+        bool eq = R.k == K.k;
+        for (int i = 0; eq && i < N * N; i++) eq = zeq32(R.e[i], K.e[i]);
+        if (!eq) continue;
+        for (int i = (int)q.size() - 1; i >= 0; i--) c.push_back(inv[q[i]]);
+        char extra[64];
+        std::snprintf(extra, sizeof extra, ", \"mitm\": [%d, %d]", a, (int)q.size());
+        print_circuit(hs, c, 1, extra, t0);
+        return 0;
+      }
+    }
+  }
+  std::printf("{\"depth\": %d, \"proved_unsat\": true, \"mitm\": [%d, %d]}\n", depth, a, b);
+  return 1;
+}
+
+template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, long chunk, int mitm) {
   thrust::device_vector<Gate> d_gates(hs.gates.begin(), hs.gates.end());
   thrust::device_vector<uint8_t> d_bad2(hs.bad2.begin(), hs.bad2.end());
   thrust::device_vector<uint32_t> d_bad3(hs.bad3.begin(), hs.bad3.end());
@@ -1115,8 +1462,6 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
   sp.goal = thrust::raw_pointer_cast(d_goal.data());
   sp.ginfo = thrust::raw_pointer_cast(d_ginfo.data());
 
-  thrust::device_vector<Node> frontier(1);
-  { Node root{}; frontier[0] = root; }
   {   // depth 0: is the target the identity?
     Mat<NQ> S; S.ovf = 0; S.k = hs.tk;
     for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) S.e[i] = st(hs.target[i], S.ovf);
@@ -1125,126 +1470,31 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
     for (int i = 0; done && i < (1 << NQ) * (1 << NQ); i++) done = zeq(ld(S.e[i]), hs.goal[i]);
     if (done) { std::printf("{\"found\": 0, \"circuit\": []}\n"); return 0; }
   }
-  for (int t = 1; t <= depth; t++) {
-    const double t0 = now();
-    const long m = (long)frontier.size();
-    thrust::device_vector<Node> next;
-    long n_w2 = 0, n_w3 = 0, n_dead = 0, n_alive = 0, n_found = 0;
-    std::vector<Node> found;
-    for (long off = 0; off < m; off += chunk) {
-      const long cm = std::min(chunk, m - off);
-      const Node *par = thrust::raw_pointer_cast(frontier.data()) + off;
-      const int nc = (int)(cm * hs.G);
-      thrust::device_vector<Mat<NQ>> R(cm);                            // pass 0
-      { Pass p_(0);
-      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)cm),
-                       ParentResidual<NQ>{sp, par, thrust::raw_pointer_cast(R.data())}); }
-      thrust::device_vector<uint8_t> status(nc);
-      thrust::device_vector<uint64_t> h1(nc), h2(nc);
-      uint8_t *st_ = thrust::raw_pointer_cast(status.data());
-      uint64_t *h1_ = thrust::raw_pointer_cast(h1.data()), *h2_ = thrust::raw_pointer_cast(h2.data());
-#ifdef __CUDACC__
-      {   // passes 1 + 2 fused, one warp per child
-        Pass p_(1);
-        const long blocks = std::min(((long)nc + WPB - 1) / WPB, 65535L * 4);
-        if (sp.states) level_warp<NQ, true><<<(unsigned)blocks, 32 * WPB>>>(sp, par, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
-        else level_warp<NQ, false><<<(unsigned)blocks, 32 * WPB>>>(sp, par, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
-        cuda_check("level kernel");
-      }
-      if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
-        std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
-        return 4;
-      }
-#else
-      thrust::device_vector<int> cheap(nc);
-      { Pass p_(1);
-      thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc),   // pass 1
-                       Cheap<NQ>{sp, par, thrust::raw_pointer_cast(R.data()), st_, thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t}); }
-      if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
-        std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
-        return 4;
-      }
-      const long nt = thrust::count(status.begin(), status.end(), (uint8_t)NEEDT);
-      if (nt) {                                                        // pass 2 on the compacted NEEDT children
-        Pass p_(2);
-        thrust::device_vector<int> idx(nt);
-        thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc), status.begin(),
-                        idx.begin(), IsStatus{NEEDT});
-        thrust::for_each(idx.begin(), idx.end(), Full<NQ>{sp, thrust::raw_pointer_cast(R.data()), st_,
-                                                          thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t});
-      }
-#endif
-      Pass p_(3);
-      n_w2 += thrust::count(status.begin(), status.end(), (uint8_t)W2CUT);
-      n_w3 += thrust::count(status.begin(), status.end(), (uint8_t)W3CUT);
-      n_dead += thrust::count(status.begin(), status.end(), (uint8_t)DEAD);
-      const long nf = thrust::count(status.begin(), status.end(), (uint8_t)FOUND);
-      MakeChild mk{thrust::raw_pointer_cast(frontier.data()) + off, thrust::raw_pointer_cast(h1.data()),
-                   thrust::raw_pointer_cast(h2.data()), hs.G};
-      if (nf) {
-        n_found += nf;
-        thrust::device_vector<int> idx(nf);
-        thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)(cm * hs.G)),
-                        status.begin(), idx.begin(), IsStatus{FOUND});
-        thrust::host_vector<int> hidx(idx);
-        thrust::host_vector<Node> par(frontier.begin() + off, frontier.begin() + off + cm);
-        for (int o : hidx) { Node c = par[o / hs.G]; c.seq[c.len++] = (uint8_t)(o % hs.G); found.push_back(c); }
-      }
-      const long na = thrust::count(status.begin(), status.end(), (uint8_t)ALIVE);
-      n_alive += na;
-      if (na && found.empty() && t < depth) {          // last level: survivors are never expanded
-        thrust::device_vector<int> idx(na);
-        thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)(cm * hs.G)),
-                        status.begin(), idx.begin(), IsStatus{ALIVE});
-        const long old = (long)next.size();
-        next.resize(old + na);
-        thrust::transform(idx.begin(), idx.end(), next.begin() + old, mk);
-      }
-    }
-    if (!found.empty()) {
-      std::sort(found.begin(), found.end(), [](const Node &a, const Node &b) {
-        for (int i = 0; i < a.len; i++) if (a.seq[i] != b.seq[i]) return a.seq[i] < b.seq[i];
-        return false; });
-      std::printf("{\"t\": %d, \"found\": %ld, \"circuit\": [", t, n_found);
-      for (int i = 0; i < found[0].len; i++) std::printf("%s\"%s\"", i ? ", " : "", hs.names[found[0].seq[i]].c_str());
-      std::printf("], \"seconds\": %.2f}\n", now() - t0);
-      return 0;
-    }
-    long distinct = (long)next.size();
-    if (dedupe && distinct > 1) {
-      Pass p_(4);
-      thrust::sort(next.begin(), next.end(), NodeLess{});
-      auto end = thrust::unique(next.begin(), next.end(), SameResidual<NQ>{sp});
-      next.erase(end, next.end());
-      distinct = (long)next.size();
-    }
-    std::printf("{\"t\": %d, \"parents\": %ld, \"prefixes\": %ld, \"cut_w3\": %ld, \"cut_lb\": %ld, \"survivors\": %ld, "
-                "\"distinct\": %ld, \"proved_unsat\": %s, \"seconds\": %.2f}\n",
-                t, m, m * hs.G - n_w2, n_w3, n_dead, n_alive, distinct, next.empty() ? "true" : "false", now() - t0);
-    std::fflush(stdout);
-    if (next.empty()) return 1;
-    frontier.swap(next);
-  }
-  // every prefix of <= depth gates was checked against the goal (pruning, windows and dedupe are sound), so a
-  // frontier left at the last level is still a proof: no circuit of <= depth gates
-  std::printf("{\"depth\": %d, \"proved_unsat\": true, \"frontier\": %ld}\n", depth, (long)frontier.size());
-  return 1;
+  const double t0 = now();
+  if (mitm) return mitm_join<NQ>(hs, sp, depth, dedupe, chunk, d_target, t0);
+  Tree T;
+  std::vector<int> found;
+  long n_found = 0;
+  const int rc = levels<NQ>(hs, sp, depth, depth, dedupe, chunk, T, found, n_found, "");
+  if (rc == 0) { print_circuit(hs, found, n_found, "", t0); return 0; }
+  return rc == 2 ? 1 : rc;
 }
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: cudasynth SPEC [--depth D] [--no-dedupe] [--chunk PARENTS]\n"
+    std::fprintf(stderr, "usage: cudasynth SPEC [--depth D] [--no-dedupe] [--chunk PARENTS] [--mitm] [--profile]\n"
                          "exit 0: circuit found, 1: no circuit of <= depth gates (proof)\n");
     return 3;
   }
   std::ifstream f(argv[1]);
   HostSpec hs = read_spec(f);
-  int depth = hs.depth; bool dedupe = true; long chunk = 1 << 17;
+  int depth = hs.depth, mitm = 0; bool dedupe = true; long chunk = 1 << 17;
   for (int i = 2; i < argc; i++) {
     if (!std::strcmp(argv[i], "--depth") && i + 1 < argc) depth = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-dedupe")) dedupe = false;
     else if (!std::strcmp(argv[i], "--chunk") && i + 1 < argc) chunk = std::atol(argv[++i]);
     else if (!std::strcmp(argv[i], "--profile")) g_prof = true;
+    else if (!std::strcmp(argv[i], "--mitm")) mitm = 1;
   }
   if (depth > DMAX) { std::fprintf(stderr, "depth > %d\n", DMAX); return 3; }
   std::fprintf(stderr, "cudasynth: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
@@ -1257,16 +1507,16 @@ int main(int argc, char **argv) {
   int rc = 3;
   switch (hs.n) {   // qubit counts compiled in: NQ_MIN..NQ_MAX (each one is a full instantiation; nvcc is slow)
 #if NQ_MIN <= 1 && NQ_MAX >= 1
-    case 1: rc = run<1>(hs, depth, dedupe, chunk); break;
+    case 1: rc = run<1>(hs, depth, dedupe, chunk, mitm); break;
 #endif
 #if NQ_MIN <= 2 && NQ_MAX >= 2
-    case 2: rc = run<2>(hs, depth, dedupe, chunk); break;
+    case 2: rc = run<2>(hs, depth, dedupe, chunk, mitm); break;
 #endif
 #if NQ_MIN <= 3 && NQ_MAX >= 3
-    case 3: rc = run<3>(hs, depth, dedupe, chunk); break;
+    case 3: rc = run<3>(hs, depth, dedupe, chunk, mitm); break;
 #endif
 #if NQ_MIN <= 4 && NQ_MAX >= 4
-    case 4: rc = run<4>(hs, depth, dedupe, chunk); break;
+    case 4: rc = run<4>(hs, depth, dedupe, chunk, mitm); break;
 #endif
     default: std::fprintf(stderr, "n = %d not built (NQ_MIN..NQ_MAX)\n", hs.n); return 3;
   }

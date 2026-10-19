@@ -69,11 +69,21 @@ State targets (item 2, partial): `spec.py --ancilla Q.. | --inputs X,..` writes 
 per-pair bounds (sde, stabilizer nullity, Schmidt ranks by exact minors). CPU build only for now - the GPU
 kernel aborts on some inputs.
 
+Frontier as a tree (parent index + last gate per node, 5 bytes instead of 72; prefixes read back by walking
+up). Children are generated parent-major, so every level is in lexicographic order and dedupe on (hash, index)
+keeps the same representative as before; per-level output identical on all test, bench and RUS instances.
+
+Meet in the middle (`--mitm`, unitaries): forward to level ceil(D/2), backward on U^dag (the backward tree is the
+table), join on hash(U p^-1) = hash(U R'), candidates confirmed exactly; complete for every length <= D. Same
+verdicts as the plain search everywhere tested. Faster when the expensive levels lie past the middle (RUS 14
+budget 12: 20 s -> 10 s, RUS 27 budget 14: 71 s -> 63 s); slower when they sit in the middle (RUS 13 budget 16:
+214 s plain, 311 s mitm, peak 6 GB - both halves pay the 124M/227M-prefix levels 7-8).
+
 Not implemented yet (in order):
 1. ~~GPU memory layout~~ (done, above).
 2. RUS / state targets: vector pairs instead of a full unitary, per-pair state bounds (section 5).
 3. Global-phase mode.
-4. Meet-in-the-middle (section 6, phase 2).
+4. ~~Meet-in-the-middle~~ (done, above; next: choose the split level by frontier size, partition the join).
 5. Multi-GPU / cluster split (phase 4).
 
 Each extra depth costs ~6-7x the work (Toffoli 10 -> 11).
