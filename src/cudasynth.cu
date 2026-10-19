@@ -1350,29 +1350,35 @@ template <int NQ> static int mitm_join(const HostSpec &hs, const Spec &sp, int d
   constexpr int N = 1 << NQ;
   if (hs.states) { std::fprintf(stderr, "--mitm: unitary targets only\n"); return 3; }
   const std::vector<int> inv = inverse_gates(hs);
-  const int a = (depth + 1) / 2, b = depth - a;
   std::vector<int> found;
   long n_found = 0;
-  Tree TF;
-  int rc = levels<NQ>(hs, sp, depth, a, dedupe, chunk, TF, found, n_found, "\"dir\": \"fwd\", ");
-  if (rc == 0) { print_circuit(hs, found, n_found, "", t0); return 0; }
-  if (rc != 2) return rc;
-
   std::vector<Zw> Ud(N * N);                                   // U^dag, same sqrt2 exponent
   for (int r = 0; r < N; r++) for (int c = 0; c < N; c++) Ud[r * N + c] = zconj(hs.target[c * N + r]);
   thrust::device_vector<Zw> d_Ud(Ud.begin(), Ud.end());
   Spec spB = sp;
   spB.target = thrust::raw_pointer_cast(d_Ud.data());
-  Tree TB;
-  n_found = 0;
-  rc = b ? levels<NQ>(hs, spB, depth, b, dedupe, chunk, TB, found, n_found, "\"dir\": \"bwd\", ") : 2;
-  if (rc == 0) {                                               // a circuit q for U^dag: U = q^-1
-    std::vector<int> c;
-    for (int i = (int)found.size() - 1; i >= 0; i--) c.push_back(inv[found[i]]);
-    print_circuit(hs, c, n_found, "", t0);
-    return 0;
+  // grow the side with the smaller frontier (the next level costs about frontier x candidates) until the depths
+  // add up to D. A dead forward side is a proof; a dead backward side at level b+1 means no suffix is longer than
+  // b, so the join with levels 1..b is already complete.
+  Tree TF, TB;
+  bool bdead = false;
+  while (TF.top() + TB.top() < depth) {
+    const bool fwd = bdead || TF.n[TF.top()] <= TB.n[TB.top()];
+    Tree &T = fwd ? TF : TB;
+    n_found = 0;
+    const int rc = levels<NQ>(hs, fwd ? sp : spB, depth, T.top() + 1, dedupe, chunk, T, found, n_found,
+                              fwd ? "\"dir\": \"fwd\", " : "\"dir\": \"bwd\", ");
+    if (rc == 0) {
+      if (fwd) { print_circuit(hs, found, n_found, "", t0); return 0; }
+      std::vector<int> c;                                      // a circuit q for U^dag: U = q^-1
+      for (int i = (int)found.size() - 1; i >= 0; i--) c.push_back(inv[found[i]]);
+      print_circuit(hs, c, n_found, "", t0);
+      return 0;
+    }
+    if (rc == 4) return 4;
+    if (rc == 1) { if (fwd) return 1; bdead = true; break; }
   }
-  if (rc == 4) return 4;                                       // rc 1: backward died; its stored levels still count
+  const int a = TF.top(), b = TB.top();
 
   const double tj = now();
   const long nf = TF.n[a];
