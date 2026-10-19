@@ -1,0 +1,14 @@
+OPENQASM 2.0;
+include "stdgates.inc";
+qreg q[3];
+creg c[3];
+h q[2];
+t q[2];
+cx q[2], q[0];
+cx q[2], q[1];
+h q[2];
+cx q[2], q[0];
+cx q[2], q[1];
+t q[2];
+h q[2];
+measure q[2] -> c[2];

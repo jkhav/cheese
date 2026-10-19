@@ -1,0 +1,22 @@
+// rus/4 without measurement: 18 gates, T 6, config smart+w2+cms, qiskit check True
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[2];
+h q[1];
+tdg q[1];
+h q[1];
+t q[1];
+h q[1];
+s q[1];
+cx q[0],q[1];
+t q[1];
+h q[1];
+t q[1];
+cx q[0],q[1];
+s q[1];
+h q[1];
+s q[1];
+t q[1];
+h q[1];
+tdg q[1];
+h q[1];
