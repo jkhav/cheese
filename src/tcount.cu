@@ -1,9 +1,9 @@
-// tcount: optimal T-count of a unitary over Clifford+T (separate from the gate-count search in cudasynth.cu).
+// tcount: optimal T-count of a unitary over Clifford+T (separate from the gate-count search in cheese.cu).
 //
 // U = R(P_1) ... R(P_t) C with R(P) = ((1 + w) I + (1 - w) P) / 2 (a pi/8 rotation about a Pauli, one T gate)
 // and C a Clifford; global phase ignored (Gosset, Kliuchnikov, Mosca, Russo). Everything works on channel
 // representations Uc[a][b] = Tr(P_a U P_b U^dag) / 2^n: real 4^n x 4^n matrices with entries
-// (x + y sqrt2) / sqrt2^e, one exponent e per matrix (python/cudasynth/tcount.py writes the spec).
+// (x + y sqrt2) / sqrt2^e, one exponent e per matrix (python/cheese/tcount.py writes the spec).
 //
 // Peeling a rotation off the left, S <- R(P)^-1 S, keeps the rows that commute with P (times sqrt2 in the
 // common exponent) and replaces an anticommuting row a by row a - s row r, where i P P_a = s P_r (checked
@@ -15,7 +15,7 @@
 // seen at a lower level is dropped). Search: peel rotations off U level by level; a residual whose coset is in
 // the table at level c gives T-count j + c, and the first level j with a hit gives the optimum (a circuit of
 // T-count t' is hit at level max(0, t' - K)). Coset equality is always confirmed exactly (columns compared after
-// sorting by hash); the decomposition is re-checked independently by `python -m cudasynth.tcount verify`.
+// sorting by hash); the decomposition is re-checked independently by `python -m cheese.tcount verify`.
 #include <thrust/copy.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>

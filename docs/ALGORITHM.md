@@ -1,9 +1,9 @@
-# How cudasynth works
+# How cheese works
 
-cudasynth finds a circuit with the fewest gates that implements a given unitary **exactly** (global phase
+cheese finds a circuit with the fewest gates that implements a given unitary **exactly** (global phase
 included), over Clifford+T plus the target's own gates, or proves that no circuit of a given size exists.
 This document describes the search, every rule that removes part of the search space, and why none of them can
-remove the optimum. Code references are to `src/cudasynth.cu` (search), `python/cudasynth/spec.py` (spec
+remove the optimum. Code references are to `src/cheese.cu` (search), `python/cheese/spec.py` (spec
 generator) and `run.sh` (outer loop).
 
 ## 1. Problem and guarantees
@@ -19,7 +19,7 @@ Output of one run with budget D (exit codes):
 
 `run.sh` calls the binary with budgets 1, 2, 3, ... (or from `--from N`). The first budget that succeeds gives
 an **optimal** circuit: every smaller budget was proved impossible. Each found circuit is re-checked exactly by
-`python -m cudasynth.verify` (independent Python code multiplying the gate matrices).
+`python -m cheese.verify` (independent Python code multiplying the gate matrices).
 
 ## 2. Exact arithmetic
 
@@ -295,7 +295,7 @@ ignored), the metric of Gosset, Kliuchnikov, Mosca and Russo and of Di Matteo an
 - GPU layout: one 64-thread block per coset, the 64 x 64 matrix in shared memory (64 KB with the comparison
   buffer), thread per row for peeling and per column for labels, bitonic sort of the columns for comparisons.
 
-Explicit circuits: `python -m cudasynth.tcircuit` turns a decomposition into Clifford+T gates. R(P) = V T_q V^dag
+Explicit circuits: `python -m cheese.tcircuit` turns a decomposition into Clifford+T gates. R(P) = V T_q V^dag
 with V a CNOT ladder (Z_q -> Z on P's support) followed by H (X) or S H (Y) on each qubit, checked exactly for
 every Pauli; the Clifford remainder is synthesised by Qiskit; the whole circuit is checked exactly against U up
 to a phase w^k.
@@ -320,4 +320,4 @@ between targets), the table is built once per qubit count and reused by every ta
   for rules that should not change the frontier (T-bound rewrite, tree layout, `--no-sym`) identical per-level
   counts on all test, bench and RUS instances.
 - Every reported circuit is multiplied out exactly (in the binary for table and meet-in-the-middle results,
-  and again by `cudasynth.verify`).
+  and again by `cheese.verify`).

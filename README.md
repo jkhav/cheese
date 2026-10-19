@@ -1,7 +1,7 @@
 # cheese
 
 **C**lifford+T **H**ardware-accelerated **E**xact **E**numerative **S**ynthesis **E**ngine, a companion to
-[milq](https://github.com/QuantumFIT/milq). The binaries and Python package are still called `cudasynth`.
+[milq](https://github.com/QuantumFIT/milq).
 
 Exact Clifford+T circuit synthesis by GPU branch-and-bound: enumerate gate sequences level by level, prune every
 prefix whose remaining work provably exceeds the depth budget, and either find a circuit or prove that none of
@@ -29,7 +29,7 @@ The NVIDIA driver must already be installed (`nvidia-smi` works). Manual builds:
 
 Found circuits are re-checked exactly and written to results/<name>-opt.qasm; per-level statistics (one JSON
 line per level: prefixes, cut by W3 / by the bounds, survivors, distinct residuals) to results/<name>-d<D>.log.
-Timings: `tests/bench.sh`. Low level: `python3 -m cudasynth.spec T.qasm D > t.spec; build/cudasynth t.spec`
+Timings: `tests/bench.sh`. Low level: `python3 -m cheese.spec T.qasm D > t.spec; build/cheese t.spec`
 (exit 0 circuit found, 1 proof, 2 open).
 
 Validated against milq's `prune_probe.py` (identical survivor counts per level, same circuits): CS 4/5,

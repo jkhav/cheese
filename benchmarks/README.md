@@ -11,12 +11,12 @@ Run as a unitary: `./run.sh benchmarks/rus/7/spec.qasm`. As a state target (RUS 
 for now): `./run.sh benchmarks/rus/7/spec.qasm --cpu --ancilla 1 2`. Note milq's `-v rus` also requires |+..+>|0..>
 as an input; `--ancilla` uses the basis inputs only, so its optima can be lower.
 
-## Results: RUS as unitaries (cudasynth, RTX 3060 Ti)
+## Results: RUS as unitaries (cheese, RTX 3060 Ti)
 
 `rus/<n>/unitary-opt.qasm`: a circuit with the fewest gates whose unitary equals `spec.qasm`'s exactly
 (measurements dropped, global phase included; gate set Clifford+T plus the spec's own gates, so ccx counts as
 one gate where the spec uses it). Optimal: `./run.sh` tried budgets 1, 2, ... and proved every budget below the
-optimum impossible; each circuit was re-checked exactly (`python -m cudasynth.verify`). "total time" covers all
+optimum impossible; each circuit was re-checked exactly (`python -m cheese.verify`). "total time" covers all
 budgets, "last budget" the one that found the circuit.
 
 | RUS | qubits | spec gates | unitary optimum | total time | last budget | gate set |
@@ -36,7 +36,7 @@ budgets, "last budget" the one that found the circuit.
 | 27 | 3 | 20 | 14 | 100 s | 71.3 s | Clifford+T |
 | 28 | 2 | 3 | 3 | 2 s | 0.2 s | Clifford+T |
 
-## Results: optimal T-count of the RUS unitaries (cudasynth T-count mode)
+## Results: optimal T-count of the RUS unitaries (cheese T-count mode)
 
 `./tcount.sh rus/<n>/spec.qasm`: the fewest T gates of any Clifford+T circuit with exactly the spec's unitary
 (measurements dropped, all branches, global phase ignored), proved optimal and verified exactly. Circuit
@@ -61,9 +61,9 @@ T-count <= 6, 3 qubits T-count <= 4).
 | 7 | 3 | 14 (2 ccx) | 14 (2 ccx) | - | 14 (2 ccx) | **4** (improved) | 0.4 s |
 
 Each decomposition is stored as `rus/<n>/tcount.json` (format in optimal/README.md; check with
-`python -m cudasynth.tcount verify rus/<n>/spec.qasm rus/<n>/tcount.json`) and as an explicit circuit
+`python -m cheese.tcount verify rus/<n>/spec.qasm rus/<n>/tcount.json`) and as an explicit circuit
 `rus/<n>/tcount-opt.qasm` with exactly that many T gates, equal to the spec up to global phase, Clifford gates
-reduced by `python -m cudasynth.tcircuit ... --opt` (optimal Clifford segments, beam-searched T placement; the
+reduced by `python -m cheese.tcircuit ... --opt` (optimal Clifford segments, beam-searched T placement; the
 total is not proved minimal). Total gates of these circuits (T-count optimal) vs the gate-count optimum
 (`unitary-opt.qasm`, whose T-count can be higher):
 

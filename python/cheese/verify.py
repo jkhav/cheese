@@ -1,7 +1,7 @@
 """Check a found circuit independently of the search: exact unitary of the printed gate list == the target's.
 
-  python -m cudasynth.verify TARGET.qasm OUTPUT [--qasm OUT.qasm] [--ancilla Q ... | --inputs X,Y,...]
-OUTPUT: cudasynth's stdout (its "circuit" line). --qasm: also write the circuit as OpenQASM 2.0.
+  python -m cheese.verify TARGET.qasm OUTPUT [--qasm OUT.qasm] [--ancilla Q ... | --inputs X,Y,...]
+OUTPUT: cheese's stdout (its "circuit" line). --qasm: also write the circuit as OpenQASM 2.0.
 --ancilla / --inputs (as for the spec): state target, only the images of those input basis states must agree.
 """
 import json, sys

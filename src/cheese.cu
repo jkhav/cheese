@@ -1,4 +1,4 @@
-// cudasynth: exact Clifford+T synthesis by level-synchronous branch-and-bound (docs/PLAN.md).
+// cheese: exact Clifford+T synthesis by level-synchronous branch-and-bound (docs/PLAN.md).
 //
 // A frontier node is a gate prefix p (indices into the spec's candidate list). Its residual S = U p^-1 is what
 // the rest of the circuit must implement; it is recomputed from p (cheap next to the bounds) instead of stored,
@@ -1150,7 +1150,7 @@ static HostSpec read_spec(std::istream &in) {
   HostSpec s;
   std::string tok;
   in >> tok;
-  if (tok != "cudasynth-spec") { std::cerr << "not a spec\n"; std::exit(2); }
+  if (tok != "cheese-spec") { std::cerr << "not a spec\n"; std::exit(2); }
   int version; in >> version;
   while (in >> tok) {
     if (tok == "n") in >> s.n;
@@ -1850,7 +1850,7 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: cudasynth SPEC [--depth D] [--no-dedupe] [--chunk PARENTS] [--mitm] [--no-sym] [--table K] [--profile]\n"
+    std::fprintf(stderr, "usage: cheese SPEC [--depth D] [--no-dedupe] [--chunk PARENTS] [--mitm] [--no-sym] [--table K] [--profile]\n"
                          "exit 0: circuit found, 1: no circuit of <= depth gates (proof)\n");
     return 3;
   }
@@ -1867,10 +1867,10 @@ int main(int argc, char **argv) {
     else if (!std::strcmp(argv[i], "--table") && i + 1 < argc) tablek = std::atoi(argv[++i]);
   }
   if (depth > DMAX) { std::fprintf(stderr, "depth > %d\n", DMAX); return 3; }
-  std::fprintf(stderr, "cudasynth: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
+  std::fprintf(stderr, "cheese: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
 #ifdef __CUDACC__
   if (hs.states) {   // the GPU state-target kernel aborts on some inputs (under investigation); CPU path validated
-    std::fprintf(stderr, "state targets: GPU path not ready yet, use build/cudasynth-cpu\n");
+    std::fprintf(stderr, "state targets: GPU path not ready yet, use build/cheese-cpu\n");
     return 3;
   }
 #endif

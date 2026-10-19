@@ -1,4 +1,4 @@
-# cudasynth: GPU branch-and-bound synthesis, plan
+# cheese: GPU branch-and-bound synthesis, plan
 
 Started from milq's GPU search plan (2026-10-19). milq's CPU prototype (`prune_probe.py`, Python, 10 processes) proves depths no
 SAT run reached (Toffoli 9, CCZ 8, half_adder_3 9, Fredkin 9; 30-180 s each) and finds optimal circuits (CS = 5).
@@ -20,13 +20,13 @@ This repository moves it to GPUs (an RTX card first, a university cluster later)
 
 ## Status (2026-10-19 evening)
 
-Implemented (`src/cudasynth.cu`, one source for both backends):
+Implemented (`src/cheese.cu`, one source for both backends):
 - Exact unitary-target branch-and-bound (phase 1 of section 6): exact Z[w] arithmetic, W2/W3 window rules,
   every bound of milq's `lower_bound(strong=True)` (H via sde, H structure, T via the exact PTM sde, CX via
   operator-Schmidt ranks over F_p + the precomputed ILP table, support), exact deduplication of residuals keeping
   the lexicographically smallest prefix (sound together with W2/W3).
 - Validated: per-level survivor counts identical to milq's `prune_probe.py`; found circuits re-checked exactly
-  (`python -m cudasynth.verify`). Regression: `tests/check.sh`.
+  (`python -m cheese.verify`). Regression: `tests/check.sh`.
 - Layout for the GPU:
   - pass 0: each parent's residual S = U p^-1 computed once per level chunk;
   - pass 1: one thread per child (W2/W3, gate, identity check, cheap bounds);

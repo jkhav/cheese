@@ -6,7 +6,7 @@ circuit has exactly t T gates. The Clifford remainder C is synthesised by Qiskit
 this step). The whole circuit is then checked with exact arithmetic: its unitary equals U up to a global phase
 w^k, as the T-count is defined.
 
-  python -m cudasynth.tcircuit TARGET.qasm DECOMPOSITION.json OUT.qasm [--opt [BEAM]]
+  python -m cheese.tcircuit TARGET.qasm DECOMPOSITION.json OUT.qasm [--opt [BEAM]]
 
 --opt: then minimise the Clifford gates with build/cliffopt (src/clifford.cu): every Clifford segment between
 two T gates replaced by an optimal one from a GPU table of the whole Clifford group, and the T gates moved

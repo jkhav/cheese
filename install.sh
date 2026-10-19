@@ -91,4 +91,4 @@ fi
 
 say "tests"
 tests/check.sh
-[ $GPU = 1 ] && echo "GPU binary: build/cudasynth. Timings: tests/bench.sh" || echo "CPU binary: build/cudasynth-cpu. Timings: tests/bench.sh"
+[ $GPU = 1 ] && echo "GPU binary: build/cheese. Timings: tests/bench.sh" || echo "CPU binary: build/cheese-cpu. Timings: tests/bench.sh"

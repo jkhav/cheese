@@ -13,7 +13,7 @@
 #
 # A budget that fails is a proof (no circuit of <= that many gates). One run with budget D returns the shortest
 # circuit of <= D gates, but small budgets prune far harder, hence the increasing loop. Each budget's per-level
-# JSON goes to results/<name>-d<D>.log; found circuits are re-checked exactly (python -m cudasynth.verify).
+# JSON goes to results/<name>-d<D>.log; found circuits are re-checked exactly (python -m cheese.verify).
 set -e
 cd "$(dirname "$0")"
 [ $# -ge 1 ] || { sed -n '2,18p' "$0"; exit 1; }
@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
     --from) FROM=$2; shift ;;
     --depth) ONLY=$2; shift ;;
     --out) OUT=$2; shift ;;
-    --cpu) BIN=build/cudasynth-cpu ;;
+    --cpu) BIN=build/cheese-cpu ;;
     --no-dedupe) PASS="$PASS --no-dedupe" ;;
     --mitm) PASS="$PASS --mitm" ;;
     --table) PASS="$PASS --table $2"; shift ;;
@@ -37,22 +37,22 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -n "$BIN" ] || BIN=$( [ -x build/cudasynth ] && echo build/cudasynth || echo build/cudasynth-cpu )
+[ -n "$BIN" ] || BIN=$( [ -x build/cheese ] && echo build/cheese || echo build/cheese-cpu )
 [ -x "$BIN" ] || { echo "no binary: run ./install.sh first"; exit 1; }
 mkdir -p results
-GATES=$(cd python && python3 -c "import sys; from cudasynth.spec import parse_qasm; print(len(parse_qasm(sys.argv[1])[1]))" "$TARGET")
+GATES=$(cd python && python3 -c "import sys; from cheese.spec import parse_qasm; print(len(parse_qasm(sys.argv[1])[1]))" "$TARGET")
 LAST=${ONLY:-$GATES}; D=${ONLY:-$FROM}
 echo "$NAME: $GATES gates in the input, $BIN, budgets $D..$LAST"
 T0=$(date +%s)
 while [ "$D" -le "$LAST" ]; do
-  (cd python && python3 -m cudasynth.spec "$TARGET" "$D" $ST > "../results/$NAME.spec" 2>/dev/null)
+  (cd python && python3 -m cheese.spec "$TARGET" "$D" $ST > "../results/$NAME.spec" 2>/dev/null)
   s=$(date +%s.%N)
   set +e; "$BIN" "results/$NAME.spec" $PASS > "results/$NAME-d$D.log" 2>/dev/null; rc=$?; set -e
   dt=$(python3 -c "import time; print(round(time.time() - $s, 1))")
   case $rc in
     0) t=$(python3 -c "import json,sys; print(json.loads(open(sys.argv[1]).read().splitlines()[-1]).get('t', 0))" "results/$NAME-d$D.log")
        echo "budget $D: circuit with $t gates found ($dt s)"
-       (cd python && python3 -m cudasynth.verify "$TARGET" "../results/$NAME-d$D.log" --qasm "../$OUT" $ST)
+       (cd python && python3 -m cheese.verify "$TARGET" "../results/$NAME-d$D.log" --qasm "../$OUT" $ST)
        [ -z "$ONLY" ] && echo "optimum: $t gates (every smaller budget proven impossible above), total $(( $(date +%s) - T0 )) s"
        exit 0 ;;
     1) echo "budget $D: no circuit of <= $D gates (proof, $dt s)" ;;

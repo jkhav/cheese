@@ -19,20 +19,20 @@ case "${1:-cpu}" in
   cpu)
     CCCL=${CCCL:-$(dirname "$(dirname "$(find .venv /usr/local/cuda/include /opt/cuda/include -path '*/thrust/version.h' 2>/dev/null | head -1)")")}
     g++ -std=c++17 -O3 -march=native -fopenmp -x c++ -DTHRUST_DEVICE_SYSTEM=THRUST_DEVICE_SYSTEM_OMP $NQDEF \
-        -I"$CCCL" src/cudasynth.cu -o build/cudasynth-cpu
-    echo build/cudasynth-cpu ;;
+        -I"$CCCL" src/cheese.cu -o build/cheese-cpu
+    echo build/cheese-cpu ;;
   cuda)
     FLAGS="-std=c++17 -O3 -arch=$ARCH --expt-relaxed-constexpr $NQDEF"
     [ -n "$CUDA_INC" ] && FLAGS="$FLAGS -I$CUDA_INC"
     [ -n "$CCCL" ] && FLAGS="$FLAGS -I$CCCL"
     [ -n "$CUDA_LIB" ] && FLAGS="$FLAGS -L$CUDA_LIB -Xlinker -rpath=$CUDA_LIB"
-    if ! $NVCC $FLAGS src/cudasynth.cu -o build/cudasynth 2> build/nvcc.log; then
+    if ! $NVCC $FLAGS src/cheese.cu -o build/cheese 2> build/nvcc.log; then
       if grep -q "unsupported GNU version" build/nvcc.log; then   # host g++ newer than this CUDA release
         echo "nvcc: host compiler newer than supported; retrying with -allow-unsupported-compiler"
-        $NVCC $FLAGS -allow-unsupported-compiler src/cudasynth.cu -o build/cudasynth
+        $NVCC $FLAGS -allow-unsupported-compiler src/cheese.cu -o build/cheese
       else cat build/nvcc.log >&2; exit 1; fi
     fi
-    echo build/cudasynth ;;
+    echo build/cheese ;;
   tcount)
     FLAGS="-std=c++17 -O3 -arch=$ARCH"
     [ -n "$CUDA_INC" ] && FLAGS="$FLAGS -I$CUDA_INC"

@@ -1,4 +1,4 @@
-"""Spec generator: QASM target -> the text spec read by the cudasynth search binary.
+"""Spec generator: QASM target -> the text spec read by the cheese search binary.
 
 Exact arithmetic throughout: an entry of Z[w] (w = e^{i pi/4}) is (a, b, c, d) = a + b w + c w^2 + d w^3, a
 matrix is (k, entries) meaning entries / sqrt2^k, normalised (k as small as possible), so equal matrices have
@@ -6,7 +6,7 @@ equal representations. Gate table, candidate order and the W2/W3 window rules fo
 (its exact gate table and window rules), so results compare one to one with
 milq's prune_probe.py.
 
-  python -m cudasynth.spec TARGET.qasm DEPTH > target.spec
+  python -m cheese.spec TARGET.qasm DEPTH > target.spec
 """
 import argparse, itertools, re, sys
 from pathlib import Path
@@ -363,7 +363,7 @@ def write_spec(out, n, circ, depth, gates=None, use3=True, inputs=None):
     lite = not standard and set(gates) <= STANDARD | {"ccx"}     # ccx: a permutation, no sqrt2
     tdiv = max(ptm_sde(g) for g in gates if g in ("t", "tdg", "ccx")) if lite else 1
     w = out.write
-    w("cudasynth-spec 1\n")
+    w("cheese-spec 1\n")
     w(f"n {n}\nmode {'unitary' if inputs is None else 'states'}\nphase exact\ndepth {depth}\n")
     w(f"standard {int(standard)}\n")                # H-, T- and structure bounds valid for this gate set
     if lite:                                         # only H (sde) and T / tdiv (T and ccx change the PTM sde by <= tdiv)

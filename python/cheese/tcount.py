@@ -5,8 +5,8 @@ about the Pauli P, one T gate), C a Clifford and t the T-count; global phase is 
 channel representations Uc[a][b] = Tr(P_a U P_b U^dag) / 2^n: real 4^n x 4^n matrices with entries in
 Z[1/sqrt2], here (x + y sqrt2) / sqrt2^e with one exponent e per matrix.
 
-  python -m cudasynth.tcount spec TARGET.qasm > target.tspec
-  python -m cudasynth.tcount verify TARGET.qasm OUTPUT     (OUTPUT: build/tcount's stdout)
+  python -m cheese.tcount spec TARGET.qasm > target.tspec
+  python -m cheese.tcount verify TARGET.qasm OUTPUT     (OUTPUT: build/tcount's stdout)
 
 The output lists rotations [p, inv]: U = X_1 ... X_t C with X = R(P_p), or R(P_p)^-1 when inv is 1.
 """
