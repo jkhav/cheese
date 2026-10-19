@@ -7,4 +7,6 @@ Every circuit from milq's `benchmarks/` (QASM + READMEs), unchanged:
 `rus/found-nm/<config>/<n>.qasm`: milq's own results for RUS without measurement (fastsynth `-v rus`,
 misc/prototypes/rus_run.py), one folder per solver configuration; each was checked with Qiskit statevectors.
 
-Not yet searchable here: cudasynth's spec only has `mode unitary`; RUS needs the state-pair mode (docs/PLAN.md §5).
+Run as a unitary: `./run.sh benchmarks/rus/7/spec.qasm`. As a state target (RUS without measurement, CPU build only
+for now): `./run.sh benchmarks/rus/7/spec.qasm --cpu --ancilla 1 2`. Note milq's `-v rus` also requires |+..+>|0..>
+as an input; `--ancilla` uses the basis inputs only, so its optima can be lower.
