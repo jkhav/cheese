@@ -185,14 +185,18 @@ HD inline uint64_t mix(uint64_t h, uint64_t v) {
   h ^= h >> 31; h *= 0xbf58476d1ce4e5b9ULL; h ^= h >> 27;
   return h;
 }
+// a sum of per-entry hashes, so a warp can hash a matrix in parallel (equal residuals are still compared exactly)
+HD inline void hash_entry(int i, Zw32 x, uint64_t &a, uint64_t &b) {
+  a += mix(mix(mix(mix(0x12345678ULL + (uint64_t)i, (uint64_t)(int64_t)x.a), (uint64_t)(int64_t)x.b), (uint64_t)(int64_t)x.c), (uint64_t)(int64_t)x.d);
+  b += mix(mix(mix(mix(0x9abcdef0ULL + 31 * (uint64_t)i, (uint64_t)((int64_t)x.d * 31 + 7)), (uint64_t)(int64_t)x.c), (uint64_t)(int64_t)x.b), (uint64_t)(int64_t)x.a);
+}
+HD inline void hash_final(int k, uint64_t a, uint64_t b, uint64_t &h1, uint64_t &h2) {
+  h1 = mix(a, (uint64_t)k); h2 = mix(b, (uint64_t)k ^ 0x5555ULL);
+}
 template <int NQ> HD inline void hash2(const Mat<NQ> &S, uint64_t &h1, uint64_t &h2) {
-  constexpr int N = 1 << NQ;
-  h1 = mix(0x12345678ULL, S.k); h2 = mix(0x9abcdef0ULL, S.k);
-  for (int i = 0; i < N * N; i++) {
-    const Zw32 x = S.e[i];
-    h1 = mix(mix(mix(mix(h1, (uint64_t)(int64_t)x.a), (uint64_t)(int64_t)x.b), (uint64_t)(int64_t)x.c), (uint64_t)(int64_t)x.d);
-    h2 = mix(mix(mix(mix(h2, (uint64_t)((int64_t)x.d * 31 + 7)), (uint64_t)(int64_t)x.c), (uint64_t)(int64_t)x.b), (uint64_t)(int64_t)x.a);
-  }
+  uint64_t a = 0, b = 0;
+  for (int i = 0; i < (1 << NQ) * (1 << NQ); i++) hash_entry(i, S.e[i], a, b);
+  hash_final(S.k, a, b, h1, h2);
 }
 
 // ---------------- lower bounds (milq depth_bounds.lower_bound, strong, -v all) ----------------
@@ -335,6 +339,60 @@ template <int NQ> HD inline int ptm_sde(const Mat<NQ> &S) {
   return best;
 }
 
+// The same bound, cheaper. Units (powers of w) don't change the valuation, so with zz = Y|Z digits of a Pauli,
+// X_ab ~ sum_{x,c} (-1)^{x.zza + c.zzb} S'[x^fa][c^fb] conj(S'[x][c]): for each (fa, fb), a 2-D Walsh-Hadamard
+// transform of N^2 products gives all (zza, zzb) at once - N^4 products in all instead of 32^n. Arithmetic in
+// Z[w] mod 2^b (U = uint32 or uint64, wrapping) is enough: v(X) = 2 min_i v2(X_i) + [X / 2^m divisible by sqrt2]
+// is read off the low bits whenever X != 0 mod 2^b, and a nonzero X = 0 mod 2^b has v >= b, need <= 0.
+template <typename U> struct ZU { U a, b, c, d; };
+template <typename U> HD inline ZU<U> zuadd(ZU<U> x, ZU<U> y) { return {U(x.a + y.a), U(x.b + y.b), U(x.c + y.c), U(x.d + y.d)}; }
+template <typename U> HD inline ZU<U> zusub(ZU<U> x, ZU<U> y) { return {U(x.a - y.a), U(x.b - y.b), U(x.c - y.c), U(x.d - y.d)}; }
+template <typename U> HD inline ZU<U> zumul(ZU<U> x, ZU<U> y) {
+  return {U(x.a * y.a - x.b * y.d - x.c * y.c - x.d * y.b), U(x.a * y.b + x.b * y.a - x.c * y.d - x.d * y.c),
+          U(x.a * y.c + x.b * y.b + x.c * y.a - x.d * y.d), U(x.a * y.d + x.b * y.c + x.c * y.b + x.d * y.a)};
+}
+template <typename U> HD inline ZU<U> zuconj(ZU<U> x) { return {x.a, U(0 - x.d), U(0 - x.c), U(0 - x.b)}; }
+template <typename U> HD inline ZU<U> zuof(Zw32 x) { return {U((int64_t)x.a), U((int64_t)x.b), U((int64_t)x.c), U((int64_t)x.d)}; }
+HD inline int ctz64(uint64_t x) {
+#ifdef __CUDA_ARCH__
+  return __ffsll((long long)x) - 1;
+#else
+  return __builtin_ctzll(x);
+#endif
+}
+template <typename U> HD inline int zuval(ZU<U> x) {   // sqrt2-adic valuation from the low bits, -1 if x = 0 mod 2^b
+  const U o = x.a | x.b | x.c | x.d;
+  if (!o) return -1;
+  const int m = ctz64((uint64_t)o);
+  const U ya = x.a >> m, yb = x.b >> m, yc = x.c >> m, yd = x.d >> m;
+  return 2 * m + (!((ya ^ yc) & 1) && !((yb ^ yd) & 1));
+}
+
+template <int NQ, typename U> HD inline int ptm_wht_t(const Mat<NQ> &S) {
+  constexpr int N = 1 << NQ, E = N * N;
+  const int top = 2 * (NQ + S.k);
+  int best = 0;
+  ZU<U> Q[E];
+  for (int fa = 0; fa < N; fa++)
+    for (int fb = 0; fb < N; fb++) {
+      for (int e = 0; e < E; e++) {
+        const int x = e >> NQ, c = e & (N - 1);
+        Q[e] = zumul(zuof<U>(S.e[(x ^ fa) * N + (c ^ fb)]), zuconj(zuof<U>(S.e[e])));
+      }
+      for (int h = 1; h < E; h <<= 1)
+        for (int e = 0; e < E; e++)
+          if (!(e & h)) { const ZU<U> u = Q[e], v = Q[e | h]; Q[e] = zuadd(u, v); Q[e | h] = zusub(u, v); }
+      for (int e = 0; e < E; e++) {
+        const int v = zuval(Q[e]);
+        if (v >= 0 && top - v > best) best = top - v;
+      }
+    }
+  return best;
+}
+template <int NQ> HD inline int ptm_wht(const Mat<NQ> &S) {
+  return 2 * (NQ + S.k) <= 64 ? ptm_wht_t<NQ, uint32_t>(S) : ptm_wht_t<NQ, uint64_t>(S);
+}
+
 template <int NQ> HD inline int cx_bound(const Mat<NQ> &S, const Spec &sp) {
   int idx = 0, mult = 1, mx = 0;
   for (int i = 0; i < sp.ncuts; i++) {
@@ -425,11 +483,253 @@ template <int NQ> struct Full {             // pass 2, on NEEDT children only: T
     Mat<NQ> C = R[i];
     apply_inv(C, sp.gates[g]);
     const int c = cheap[o], h = c & 1023, c2 = (c >> 10) & 1023, supp = c >> 20;
-    if (combine(h, ptm_sde(C), c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
+#ifdef CHECK_T
+    if (ptm_wht(C) != ptm_sde(C)) { std::printf("T MISMATCH %d %d k=%d\n", ptm_wht(C), ptm_sde(C), C.k); std::abort(); }
+#endif
+    if (combine(h, ptm_wht(C), c2, supp) > sp.depth - t) { status[o] = DEAD; return; }
     status[o] = ALIVE;
     hash2(C, h1[o], h2[o]);
   }
 };
+
+#ifdef __CUDACC__
+// pass 2 on the GPU: one warp per child. The child residual lives in shared memory (each lane owns entries
+// lane, lane + 32, ...), the Walsh-Hadamard butterflies across lanes are shuffles, the max is a warp reduction.
+constexpr unsigned FULL_MASK = 0xffffffffu;
+constexpr int WPB = 4;                       // warps per block
+
+template <typename U> __device__ inline ZU<U> zushfl(ZU<U> x, int m) {
+  return {__shfl_xor_sync(FULL_MASK, x.a, m), __shfl_xor_sync(FULL_MASK, x.b, m), __shfl_xor_sync(FULL_MASK, x.c, m),
+          __shfl_xor_sync(FULL_MASK, x.d, m)};
+}
+
+template <int NQ, typename U> __device__ int warp_wht(const Zw32 *S, int k, int lane) {
+  constexpr int N = 1 << NQ, E = N * N, EPL = E >= 32 ? E / 32 : 1;
+  const int top = 2 * (NQ + k);
+  int best = 0;
+  for (int fa = 0; fa < N; fa++)
+    for (int fb = 0; fb < N; fb++) {
+      ZU<U> q[EPL];
+#pragma unroll
+      for (int j = 0; j < EPL; j++) {
+        const int e = lane + 32 * j;
+        if (e < E) {
+          const int x = e >> NQ, c = e & (N - 1);
+          q[j] = zumul(zuof<U>(S[(x ^ fa) * N + (c ^ fb)]), zuconj(zuof<U>(S[e])));
+        } else q[j] = {0, 0, 0, 0};
+      }
+#pragma unroll
+      for (int h = 1; h < E; h <<= 1) {
+        if (h < 32) {
+#pragma unroll
+          for (int j = 0; j < EPL; j++) {
+            const ZU<U> o = zushfl(q[j], h);
+            q[j] = (lane & h) ? zusub(o, q[j]) : zuadd(q[j], o);
+          }
+        } else {
+          const int hj = h / 32;
+#pragma unroll
+          for (int j = 0; j < EPL; j++)
+            if (!(j & hj)) { const ZU<U> u = q[j], v = q[j | hj]; q[j] = zuadd(u, v); q[j | hj] = zusub(u, v); }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < EPL; j++) {
+        const int v = zuval(q[j]);
+        if (v >= 0 && top - v > best) best = top - v;
+      }
+    }
+  for (int m = 16; m; m >>= 1) { const int o = __shfl_xor_sync(FULL_MASK, best, m); if (o > best) best = o; }
+  return best;
+}
+
+// child residual S = parent g^-1, normalised (as apply_inv + normalise); returns its sqrt2 exponent
+template <int NQ> __device__ int warp_child(Zw32 *S, const Mat<NQ> &P, const Gate &gt, int lane, bool &ovf) {
+  constexpr int N = 1 << NQ, E = N * N, EPL = E >= 32 ? E / 32 : 1;
+  for (int e = lane; e < E; e += 32) S[e] = P.e[e];
+  int k = P.k;
+  __syncwarp();
+  const int L = 1 << gt.nq;
+  int mask = 0;
+  for (int j = 0; j < gt.nq; j++) mask |= 1 << gt.q[j];
+  Zw32 nv[EPL];
+  int of = 0;
+#pragma unroll
+  for (int j = 0; j < EPL; j++) {
+    const int e = lane + 32 * j;
+    if (e >= E) continue;
+    const int r = e >> NQ, col = e & (N - 1), base = col & ~mask;
+    int lc = 0;
+    for (int jj = 0; jj < gt.nq; jj++) lc |= ((col >> gt.q[jj]) & 1) << jj;
+    Zw acc{0, 0, 0, 0};
+    for (int m = 0; m < L; m++) {
+      const Zw gm = gt.inv[m * L + lc];
+      if (zzero(gm)) continue;
+      int x = base;
+      for (int jj = 0; jj < gt.nq; jj++) if ((m >> jj) & 1) x |= 1 << gt.q[jj];
+      acc = zadd(acc, zmul(ld(S[r * N + x]), gm));
+    }
+    nv[j] = st(acc, of);
+  }
+  __syncwarp();
+#pragma unroll
+  for (int j = 0; j < EPL; j++) if (lane + 32 * j < E) S[lane + 32 * j] = nv[j];
+  k += gt.ik;
+  while (k > 0) {
+    bool ok = true;
+#pragma unroll
+    for (int j = 0; j < EPL; j++) if (lane + 32 * j < E && !zdiv2ok32(S[lane + 32 * j])) ok = false;
+    if (!__all_sync(FULL_MASK, ok)) break;
+#pragma unroll
+    for (int j = 0; j < EPL; j++) if (lane + 32 * j < E) S[lane + 32 * j] = zdown32(S[lane + 32 * j]);
+    k--;
+  }
+  ovf = __any_sync(FULL_MASK, of || P.ovf);
+  __syncwarp();
+  return k;
+}
+
+template <int NQ> __device__ bool warp_identity(const Zw32 *S, int k, int lane) {
+  constexpr int N = 1 << NQ, E = N * N;
+  if (k) return false;
+  bool ok = true;
+  for (int e = lane; e < E; e += 32) {
+    const Zw32 x = S[e];
+    if ((e >> NQ) == (e & (N - 1)) ? !(x.a == 1 && !x.b && !x.c && !x.d) : !zzero32(x)) ok = false;
+  }
+  return __all_sync(FULL_MASK, ok);
+}
+
+template <int NQ> __device__ int warp_h_struct(const Zw32 *S, int lane) {   // lane c: column c (N <= 16)
+  constexpr int N = 1 << NQ;
+  int nz = 0, row = 0;
+  if (lane < N) for (int r = 0; r < N; r++) if (!zzero32(S[r * N + lane])) { nz++; row = r; }
+  if (__any_sync(FULL_MASK, lane < N && nz != 1)) return 0;
+  const int c0 = __shfl_sync(FULL_MASK, row, 0);
+  int x = c0;
+  for (int i = 0; i < NQ; i++) {
+    const int pb = __shfl_sync(FULL_MASK, row, 1 << i);
+    if ((lane >> i) & 1) x ^= pb ^ c0;
+  }
+  return __any_sync(FULL_MASK, lane < N && row != x) ? 2 : 0;
+}
+
+template <int NQ> __device__ int warp_support(const Zw32 *S, int lane) {
+  constexpr int N = 1 << NQ, E = N * N;
+  int cnt = 0;
+  for (int q = 0; q < NQ; q++) {
+    const int bit = 1 << q;
+    bool nt = false;
+    for (int e = lane; e < E; e += 32) {
+      const int r = e >> NQ, c = e & (N - 1);
+      if ((r ^ c) & bit) { if (!zzero32(S[e])) nt = true; }
+      else if (!((r | c) & bit) && !zeq32(S[e], S[(r | bit) * N + (c | bit)])) nt = true;
+    }
+    cnt += __any_sync(FULL_MASK, nt);
+  }
+  return cnt;
+}
+
+// cut_rank with the R x C matrix (R = 4^|A| <= 16 rows) in shared memory M, row factors in F
+template <int NQ> __device__ int warp_cut_rank(const Zw32 *S, uint32_t *M, uint32_t *F, int A, int sa, uint64_t w, int lane) {
+  constexpr int N = 1 << NQ, E = N * N;
+  const int R = 1 << (2 * sa), C = E / R;
+  for (int e = lane; e < E; e += 32) {
+    const int o = e >> NQ, i = e & (N - 1);
+    int oa = 0, ob = 0, ia = 0, ib = 0, na = 0, nb = 0;
+    for (int q = 0; q < NQ; q++) {
+      if ((A >> q) & 1) { oa |= ((o >> q) & 1) << na; ia |= ((i >> q) & 1) << na; na++; }
+      else { ob |= ((o >> q) & 1) << nb; ib |= ((i >> q) & 1) << nb; nb++; }
+    }
+    M[((oa << na) | ia) * C + ((ob << nb) | ib)] = (uint32_t)zmod(ld(S[e]), w);
+  }
+  __syncwarp();
+  int rank = 0;
+  for (int c = 0; c < C && rank < R; c++) {
+    const unsigned bal = __ballot_sync(FULL_MASK, lane >= rank && lane < R && M[lane * C + c] != 0);
+    if (!bal) continue;
+    const int piv = __ffs(bal) - 1;
+    if (piv != rank) {
+      for (int j = lane; j < C; j += 32) { const uint32_t x = M[piv * C + j]; M[piv * C + j] = M[rank * C + j]; M[rank * C + j] = x; }
+      __syncwarp();
+    }
+    const uint64_t inv = powmod(M[rank * C + c], PRIME - 2);
+    if (lane > rank && lane < R) F[lane] = (uint32_t)mulmod(M[lane * C + c], inv);
+    __syncwarp();
+    for (int x = lane; x < R * C; x += 32) {
+      const int r = x / C, j = x % C;
+      if (r > rank && j >= c && F[r]) M[x] = (uint32_t)((M[x] + PRIME - mulmod(F[r], M[rank * C + j])) % PRIME);
+    }
+    __syncwarp();
+    rank++;
+  }
+  return rank;
+}
+
+template <int NQ> __device__ int warp_cx_bound(const Zw32 *S, uint32_t *M, uint32_t *F, const Spec &sp, int lane) {
+  int idx = 0, mult = 1, mx = 0;
+  for (int i = 0; i < sp.ncuts; i++) {
+    const int rk = warp_cut_rank<NQ>(S, M, F, sp.cutmask[i], sp.cutsize[i], sp.w8, lane);
+    int need = 0;
+    while ((1 << need) < rk) need++;
+    if (need > sp.rad[i] - 1) need = sp.rad[i] - 1;
+    idx += need * mult;
+    mult *= sp.rad[i];
+    if (need > mx) mx = need;
+  }
+  return sp.have_table ? sp.cxtable[idx] : mx;
+}
+
+// one level, fused: one warp per child does windows, child residual, identity, cheap bounds, T bound, hash
+template <int NQ> __global__ void __launch_bounds__(32 * WPB)
+level_warp(Spec sp, const Node *parents, const Mat<NQ> *R, long nc, uint8_t *status, uint64_t *h1, uint64_t *h2, int t) {
+  constexpr int N = 1 << NQ, E = N * N;
+  __shared__ Zw32 shS[WPB][E];
+  __shared__ uint32_t shM[WPB][E], shF[WPB][16];
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  Zw32 *S = shS[w];
+  for (long o = (long)blockIdx.x * WPB + w; o < nc; o += (long)gridDim.x * WPB) {
+    const int i = (int)(o / sp.G), g = (int)(o % sp.G);
+    const Node &p = parents[i];
+    uint8_t s;
+    if (p.len >= 1 && sp.bad2[p.seq[p.len - 1] * sp.G + g]) s = W2CUT;
+    else if (p.len >= 2 && ((sp.bad3[(((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g) >> 5] >>
+                             ((((uint32_t)p.seq[p.len - 2] * sp.G + p.seq[p.len - 1]) * sp.G + g) & 31)) & 1)) s = W3CUT;
+    else {
+      bool ovf;
+      const int k = warp_child<NQ>(S, R[i], sp.gates[g], lane, ovf);
+      if (ovf) s = OVF;
+      else if (warp_identity<NQ>(S, k, lane)) s = FOUND;
+      else {
+        bool alive = true;
+        if (sp.standard) {
+          const int hs = warp_h_struct<NQ>(S, lane), h = k > hs ? k : hs;
+          const int supp = warp_support<NQ>(S, lane), c2 = warp_cx_bound<NQ>(S, shM[w], shF[w], sp, lane);
+          if (combine(h, 0, c2, supp) > sp.depth - t) alive = false;
+          else {
+            const int T = 2 * (NQ + k) <= 64 ? warp_wht<NQ, uint32_t>(S, k, lane) : warp_wht<NQ, uint64_t>(S, k, lane);
+            alive = combine(h, T, c2, supp) <= sp.depth - t;
+          }
+        }
+        if (alive) {
+          uint64_t a = 0, b = 0;
+          for (int e = lane; e < E; e += 32) hash_entry(e, S[e], a, b);
+          for (int m = 16; m; m >>= 1) { a += __shfl_xor_sync(FULL_MASK, a, m); b += __shfl_xor_sync(FULL_MASK, b, m); }
+          if (!lane) hash_final(k, a, b, h1[o], h2[o]);
+        }
+        s = alive ? ALIVE : DEAD;
+      }
+    }
+    if (!lane) status[o] = s;
+    __syncwarp();
+  }
+}
+
+static void cuda_check(const char *what) {
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) { std::fprintf(stderr, "CUDA error after %s: %s\n", what, cudaGetErrorString(e)); std::exit(5); }
+}
+#endif
 
 struct IsStatus { uint8_t v; HD bool operator()(uint8_t s) const { return s == v; } };
 
@@ -522,6 +822,25 @@ static HostSpec read_spec(std::istream &in) {
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+static bool g_prof = false;            // --profile: per-pass seconds on stderr (synchronises after each pass)
+static double g_pt[8];
+static const char *g_pn[8] = {"residual", "cheap", "T", "compact", "dedupe", "", "", ""};
+struct Pass {
+  int i; double t0;
+  explicit Pass(int i_) : i(i_), t0(g_prof ? now() : 0) {}
+  ~Pass() {
+    if (!g_prof) return;
+#ifdef __CUDACC__
+    cudaDeviceSynchronize();
+#endif
+    g_pt[i] += now() - t0;
+  }
+};
+static void prof_report() {
+  if (!g_prof) return;
+  for (int i = 0; i < 8; i++) if (g_pn[i][0]) std::fprintf(stderr, "  %-9s %.3f s\n", g_pn[i], g_pt[i]);
+}
+
 template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, long chunk) {
   thrust::device_vector<Gate> d_gates(hs.gates.begin(), hs.gates.end());
   thrust::device_vector<uint8_t> d_bad2(hs.bad2.begin(), hs.bad2.end());
@@ -560,27 +879,44 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
       const Node *par = thrust::raw_pointer_cast(frontier.data()) + off;
       const int nc = (int)(cm * hs.G);
       thrust::device_vector<Mat<NQ>> R(cm);                            // pass 0
+      { Pass p_(0);
       thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)cm),
-                       ParentResidual<NQ>{sp, par, thrust::raw_pointer_cast(R.data())});
+                       ParentResidual<NQ>{sp, par, thrust::raw_pointer_cast(R.data())}); }
       thrust::device_vector<uint8_t> status(nc);
-      thrust::device_vector<int> cheap(nc);
       thrust::device_vector<uint64_t> h1(nc), h2(nc);
       uint8_t *st_ = thrust::raw_pointer_cast(status.data());
       uint64_t *h1_ = thrust::raw_pointer_cast(h1.data()), *h2_ = thrust::raw_pointer_cast(h2.data());
+#ifdef __CUDACC__
+      {   // passes 1 + 2 fused, one warp per child
+        Pass p_(1);
+        const long blocks = std::min(((long)nc + WPB - 1) / WPB, 65535L * 4);
+        level_warp<NQ><<<(unsigned)blocks, 32 * WPB>>>(sp, par, thrust::raw_pointer_cast(R.data()), nc, st_, h1_, h2_, t);
+        cuda_check("level kernel");
+      }
+      if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
+        std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
+        return 4;
+      }
+#else
+      thrust::device_vector<int> cheap(nc);
+      { Pass p_(1);
       thrust::for_each(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc),   // pass 1
-                       Cheap<NQ>{sp, par, thrust::raw_pointer_cast(R.data()), st_, thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t});
+                       Cheap<NQ>{sp, par, thrust::raw_pointer_cast(R.data()), st_, thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t}); }
       if (thrust::count(status.begin(), status.end(), (uint8_t)OVF)) {
         std::fprintf(stderr, "residual coefficients exceed the storage type: rebuild with -DSTORE64\n");
         return 4;
       }
       const long nt = thrust::count(status.begin(), status.end(), (uint8_t)NEEDT);
       if (nt) {                                                        // pass 2 on the compacted NEEDT children
+        Pass p_(2);
         thrust::device_vector<int> idx(nt);
         thrust::copy_if(thrust::counting_iterator<int>(0), thrust::counting_iterator<int>(nc), status.begin(),
                         idx.begin(), IsStatus{NEEDT});
         thrust::for_each(idx.begin(), idx.end(), Full<NQ>{sp, thrust::raw_pointer_cast(R.data()), st_,
                                                           thrust::raw_pointer_cast(cheap.data()), h1_, h2_, t});
       }
+#endif
+      Pass p_(3);
       n_w2 += thrust::count(status.begin(), status.end(), (uint8_t)W2CUT);
       n_w3 += thrust::count(status.begin(), status.end(), (uint8_t)W3CUT);
       n_dead += thrust::count(status.begin(), status.end(), (uint8_t)DEAD);
@@ -618,6 +954,7 @@ template <int NQ> static int run(const HostSpec &hs, int depth, bool dedupe, lon
     }
     long distinct = (long)next.size();
     if (dedupe && distinct > 1) {
+      Pass p_(4);
       thrust::sort(next.begin(), next.end(), NodeLess{});
       auto end = thrust::unique(next.begin(), next.end(), SameResidual<NQ>{sp});
       next.erase(end, next.end());
@@ -647,22 +984,26 @@ int main(int argc, char **argv) {
     if (!std::strcmp(argv[i], "--depth") && i + 1 < argc) depth = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-dedupe")) dedupe = false;
     else if (!std::strcmp(argv[i], "--chunk") && i + 1 < argc) chunk = std::atol(argv[++i]);
+    else if (!std::strcmp(argv[i], "--profile")) g_prof = true;
   }
   if (depth > DMAX) { std::fprintf(stderr, "depth > %d\n", DMAX); return 3; }
   std::fprintf(stderr, "cudasynth: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
+  int rc = 3;
   switch (hs.n) {   // qubit counts compiled in: NQ_MIN..NQ_MAX (each one is a full instantiation; nvcc is slow)
 #if NQ_MIN <= 1 && NQ_MAX >= 1
-    case 1: return run<1>(hs, depth, dedupe, chunk);
+    case 1: rc = run<1>(hs, depth, dedupe, chunk); break;
 #endif
 #if NQ_MIN <= 2 && NQ_MAX >= 2
-    case 2: return run<2>(hs, depth, dedupe, chunk);
+    case 2: rc = run<2>(hs, depth, dedupe, chunk); break;
 #endif
 #if NQ_MIN <= 3 && NQ_MAX >= 3
-    case 3: return run<3>(hs, depth, dedupe, chunk);
+    case 3: rc = run<3>(hs, depth, dedupe, chunk); break;
 #endif
 #if NQ_MIN <= 4 && NQ_MAX >= 4
-    case 4: return run<4>(hs, depth, dedupe, chunk);
+    case 4: rc = run<4>(hs, depth, dedupe, chunk); break;
 #endif
     default: std::fprintf(stderr, "n = %d not built (NQ_MIN..NQ_MAX)\n", hs.n); return 3;
   }
+  prof_report();
+  return rc;
 }

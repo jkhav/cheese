@@ -40,21 +40,30 @@ Implemented (`src/cudasynth.cu`, one source for both backends):
   tests), `run.sh` (optimum by increasing budgets, every failed budget a proof, verified QASM out),
   `tests/bench.sh` (timings).
 
-Results (CPU build, 12-thread laptop; no GPU numbers yet): Toffoli 9 7.9 s, CCZ 8 7.0 s, Toffoli 10 23 s,
-Toffoli 11 2.3 min (all impossible; no SAT run proved any of these). Dedupe removes 6-33% of survivors from
-level 4 on (Toffoli 11, level 6: 221,049 -> 147,656).
+Results (CPU build, 12-thread laptop): Toffoli 9 7.9 s, CCZ 8 7.0 s, Toffoli 10 23 s, Toffoli 11 2.3 min (all
+impossible; no SAT run proved any of these). Dedupe removes 6-33% of survivors from level 4 on (Toffoli 11,
+level 6: 221,049 -> 147,656).
+
+GPU memory layout (2026-10-19 night, RTX 3060 Ti; per-level counts identical to the previous version on every
+test and bench instance):
+- First GPU measurement: the T bound took 27 of 28.5 s on Toffoli 11 (4-6 KB of local memory per thread).
+- T bound rewritten: units don't change sqrt2-valuations, so for each (fa, fb) one 2-D Walsh-Hadamard transform
+  of N^2 products gives all X_ab: N^4 products instead of 32^n, in Z[w] mod 2^32 (exact valuations whenever
+  2(n+k) <= 64, else mod 2^64).
+- One fused kernel, one warp per child: windows, child residual in shared memory, identity, H / structure /
+  support / CX bounds (Gaussian elimination across lanes), T bound (butterflies by shuffles), hash (sum of
+  per-entry hashes). No stack, 64 registers. The CPU build keeps the scalar two-pass path.
+- Toffoli 10 5.2 s -> 0.54 s, Toffoli 11 30.5 s -> 1.25 s, Toffoli 12 impossible in 7.9 s (new). Remaining
+  time at Toffoli 12: kernel 4.7 s, dedupe 1.6 s, parent residuals 0.9 s (`--profile`).
 
 Not implemented yet (in order):
-1. GPU memory layout, from the first GPU measurements: per-thread state small enough for registers, gate tables
-   and the CX table in shared memory, warp-cooperative PTM (one warp per child for the 4^n x 4^n transfer matrix).
+1. ~~GPU memory layout~~ (done, above).
 2. RUS / state targets: vector pairs instead of a full unitary, per-pair state bounds (section 5).
 3. Global-phase mode.
 4. Meet-in-the-middle (section 6, phase 2).
 5. Multi-GPU / cluster split (phase 4).
 
-Expected GPU speed (estimate, to be replaced by measurements): the current version about 3-10x the laptop CPU
-(int64 products, large per-thread state); after item 1 about 30-100x. Each extra depth costs ~6-7x the work
-(Toffoli 10 -> 11), so 100x is ~2 more depths at equal time.
+Each extra depth costs ~6-7x the work (Toffoli 10 -> 11).
 
 ## 1. What the algorithm is
 
