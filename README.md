@@ -27,13 +27,14 @@ Details: [benchmarks/README.md](benchmarks/README.md), [benchmarks/optimal/READM
 | RUS 2, 8, 12, 20, 28 | 7, 11, 8, 9, 3 | same as input: input proved optimal | 2-13 s |
 
 For context: milq's SAT runs proved Toffoli impossible up to 8 gates, its Python branch-and-bound prototype up to
-10 (Fredkin 9); this search reaches 14 (Fredkin 16). RUS circuits are taken as their full unitary (measurement dropped), so a circuit that is only right
-on the success branch can be shorter.
+10 (Fredkin 9); this search reaches 14 (Fredkin 16). RUS circuits are taken as their full
+unitary (measurement dropped), so a circuit that is only right on the success branch can be shorter.
 
 **Optimal T-counts, proved** (up to global phase):
 - RUS 7: 14 -> **4** (two Toffolis replaced), RUS 13: 14 -> **8**, RUS 14: 12 -> **6** (ccx counted as 7 T).
-- RUS 8: T-count 4, listed as best known in its source paper, is now proved optimal.
-- Every other RUS instance: the benchmark circuit's T-count proved optimal.
+- RUS 8: T-count 4, described as the best known in its benchmark README, is now proved optimal.
+- The other RUS instances run (2-3 qubits: 1-6, 12, 20, 27, 28): the benchmark circuit's T-count proved optimal.
+  The 4-7 qubit instances (9-11, 15-19, 21-26) are not run yet.
 - Toffoli, Fredkin, Peres, CCZ 7 (the known optimum, as a check), relative-phase Toffoli 4, CS 3, QFT_2 3,
   about 1 s each once the coset table is built (41 s, cached).
 
