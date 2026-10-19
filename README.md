@@ -38,6 +38,11 @@ unitary (measurement dropped), so a circuit that is only right on the success br
 - Toffoli, Fredkin, Peres, CCZ 7 (the known optimum, as a check), relative-phase Toffoli 4, CS 3, QFT_2 3,
   about 1 s each once the coset table is built (41 s, cached).
 
+**Fewer Clifford gates at optimal T-count** (Clifford mode, below; segments optimal, total not proved minimal):
+Toffoli 28 -> 20 gates, Fredkin 67 -> 21, Peres 28 -> 15, CCZ 24 -> 16, relative-phase Toffoli 29 -> 12; CS 5 and
+QFT_2 7 reach their gate-count optimum. The whole 3-qubit Clifford group (92,897,280 elements) is tabulated in
+about 3 s on the GPU.
+
 **Speed:** Toffoli 11 proved impossible in 0.5 s on the GPU (2.3 min on the CPU build), Toffoli 12 in 7.9 s.
 
 ## Install and build
@@ -75,7 +80,16 @@ Toffoli, Fredkin, Peres, CCZ (T-count 7) take about 1 s each on an RTX 3060 Ti o
 (41 s, cached in build/) exists. Method in [docs/ALGORITHM.md](docs/ALGORITHM.md) section 10, results in
 docs/PLAN.md and benchmarks/README.md.
 
-## License
+## Clifford mode
+
+    ./build.sh cliffopt                                                    # build/cliffopt (src/clifford.cu)
+    python3 -m cheese.tcircuit TARGET.qasm DECOMP.json OUT.qasm --opt     # run from python/; needs Qiskit
+
+Turns a T-count decomposition (from `./tcount.sh`) into an explicit circuit with exactly that many T gates, then
+replaces every Clifford segment between T gates by an optimal one from a GPU table of the whole Clifford group
+(up to 3 qubits) and beam-searches where the T gates sit to make the total small. Every result is checked
+exactly. Method: [docs/ALGORITHM.md](docs/ALGORITHM.md) section 10.
+
 
 MIT, see [LICENSE](LICENSE). Benchmark circuits in `benchmarks/` come from milq and the sources named in
 their READMEs (MQT Bench, published RUS papers).
