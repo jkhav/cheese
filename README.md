@@ -14,6 +14,16 @@ Status: early development. The CPU reference prototype lives in milq (`misc/prot
 
 For a CPU-only machine, `pip install nvidia-cuda-cccl` into `.venv` provides the headers (build.sh finds them).
 
+## On a machine with an NVIDIA GPU
+
+    nvidia-smi && nvcc --version            # driver + CUDA toolkit (12.x or 13.x)
+    git clone git@github.com:jkhav/cudasynth.git && cd cudasynth
+    NQ="2 3" ARCH=native ./build.sh cuda    # 2-3 qubits keeps the nvcc build short; NQ="1 4" for everything
+    tests/check.sh                          # known verdicts, found circuits verified exactly
+    tests/bench.sh                          # timings on the proofs SAT could not reach
+
+Python >= 3.8, standard library only (the spec generator and the verifier).
+
 ## Run
 
     cd python && python3 -m cudasynth.spec TARGET.qasm DEPTH > ../target.spec
