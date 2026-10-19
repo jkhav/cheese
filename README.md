@@ -7,31 +7,28 @@ measurement. See [docs/PLAN.md](docs/PLAN.md).
 
 Status: early development. The CPU reference prototype lives in milq (`misc/prototypes/prune_probe.py`).
 
-## Build
+## Install and build
 
-    ./build.sh cpu                 # g++ + OpenMP; Thrust headers from the CUDA toolkit or CCCL=/path/to/cccl
-    ARCH=sm_89 ./build.sh cuda     # nvcc; ARCH = your GPU (sm_86 RTX 30xx, sm_89 RTX 40xx, sm_120 RTX 50xx)
+    ./install.sh              # checks the NVIDIA driver, finds nvcc (or installs NVIDIA's CUDA compiler wheels into
+                              # .venv, no root), builds the GPU + CPU binaries, runs tests/check.sh
+    ./install.sh --cpu-only   # any machine without an NVIDIA GPU
+    NQ="1 4" ./install.sh     # compile 1-4 qubit support (default 2-3; nvcc takes a few minutes per qubit count)
 
-For a CPU-only machine, `pip install nvidia-cuda-cccl` into `.venv` provides the headers (build.sh finds them).
-
-## On a machine with an NVIDIA GPU
-
-    nvidia-smi && nvcc --version            # driver + CUDA toolkit (12.x or 13.x)
-    git clone git@github.com:jkhav/cudasynth.git && cd cudasynth
-    NQ="2 3" ARCH=native ./build.sh cuda    # 2-3 qubits keeps the nvcc build short; NQ="1 4" for everything
-    tests/check.sh                          # known verdicts, found circuits verified exactly
-    tests/bench.sh                          # timings on the proofs SAT could not reach
-
-Python >= 3.8, standard library only (the spec generator and the verifier).
+The NVIDIA driver must already be installed (`nvidia-smi` works). Manual builds: `./build.sh cpu|cuda`
+(settings in build/config.sh, written by install.sh).
 
 ## Run
 
-    cd python && python3 -m cudasynth.spec TARGET.qasm DEPTH > ../target.spec
-    ./build/cudasynth target.spec [--depth D] [--no-dedupe] [--chunk PARENTS]
+    ./run.sh TARGET.qasm                # optimal circuit: budgets 1, 2, ... until one is found; every failed budget is a proof
+    ./run.sh TARGET.qasm --from 9       # start at budget 9 (when smaller budgets are already known impossible)
+    ./run.sh TARGET.qasm --depth 10     # one budget: a circuit of <= 10 gates, or a proof that none exists
+    ./run.sh TARGET.qasm --cpu          # CPU binary even when the GPU one exists
 
-One JSON line per level (prefixes examined, cut by W3 / by the bounds, survivors, distinct residuals). Exit code
-0: a circuit was found (printed), 1: no circuit of <= D gates exists (proof), 2: open.
+Found circuits are re-checked exactly and written to results/<name>-opt.qasm; per-level statistics (one JSON
+line per level: prefixes, cut by W3 / by the bounds, survivors, distinct residuals) to results/<name>-d<D>.log.
+Timings: `tests/bench.sh`. Low level: `python3 -m cudasynth.spec T.qasm D > t.spec; build/cudasynth t.spec`
+(exit 0 circuit found, 1 proof, 2 open).
 
 Validated against milq's `prune_probe.py` (identical survivor counts per level, same circuits): CS 4/5,
 Toffoli 7/8/9, CCZ 8. CPU build on a 12-thread laptop: Toffoli 9 in 7.9 s, CCZ 8 in 7.0 s (Python prototype:
-175 s and 163 s on 10 processes; SAT: no proof within its runs).
+175 s and 163 s on 10 processes; SAT: no proof within its runs); Toffoli 10 in 23 s and Toffoli 11 in 2.5 min.
