@@ -295,6 +295,11 @@ ignored), the metric of Gosset, Kliuchnikov, Mosca and Russo and of Di Matteo an
 - GPU layout: one 64-thread block per coset, the 64 x 64 matrix in shared memory (64 KB with the comparison
   buffer), thread per row for peeling and per column for labels, bitonic sort of the columns for comparisons.
 
+Explicit circuits: `python -m cudasynth.tcircuit` turns a decomposition into Clifford+T gates. R(P) = V T_q V^dag
+with V a CNOT ladder (Z_q -> Z on P's support) followed by H (X) or S H (Y) on each qubit, checked exactly for
+every Pauli; the Clifford remainder is synthesised by Qiskit; the whole circuit is checked exactly against U up
+to a phase w^k.
+
 Unlike Di Matteo and Mosca's parallel collision search (deterministic walks, distinguished points, nothing kept
 between targets), the table is built once per qubit count and reused by every target.
 

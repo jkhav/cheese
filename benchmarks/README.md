@@ -61,7 +61,9 @@ T-count <= 6, 3 qubits T-count <= 4).
 | 7 | 3 | 14 (2 ccx) | 14 (2 ccx) | - | 14 (2 ccx) | **4** (improved) | 0.4 s |
 
 Each decomposition is stored as `rus/<n>/tcount.json` (format in optimal/README.md; check with
-`python -m cudasynth.tcount verify rus/<n>/spec.qasm rus/<n>/tcount.json`).
+`python -m cudasynth.tcount verify rus/<n>/spec.qasm rus/<n>/tcount.json`) and as an explicit circuit
+`rus/<n>/tcount-opt.qasm` with exactly that many T gates, equal to the spec up to global phase (only the T-count
+is optimal; Clifford gates are not minimised).
 
 The T-count is of the full unitary; a RUS circuit only has to be right on its success branch, so its own optimum
 can be lower. The output is a decomposition into Pauli rotations and a Clifford, not yet an explicit gate list.

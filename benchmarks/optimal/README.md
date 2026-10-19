@@ -8,3 +8,8 @@
   R(P) = ((1 + w) I + (1 - w) P) / 2, P_p the Pauli with digit (p >> 2q) & 3 on qubit q (0 I, 1 X, 2 Y, 3 Z),
   and C a Clifford. Check: `python -m cudasynth.tcount verify tests/qasm/<name>.qasm benchmarks/optimal/<name>-tcount.json`.
   Toffoli, Fredkin, Peres, CCZ: 7; relative-phase Toffoli 4; CS 3; QFT_2 3.
+- `<name>-tcount.qasm`: the same decompositions as explicit Clifford+T circuits with exactly that many T/Tdg
+  gates, equal to the target up to global phase (checked exactly). Built by
+  `python -m cudasynth.tcircuit TARGET.qasm DECOMPOSITION.json OUT.qasm`: each rotation is V T V^dag with a
+  Clifford V (CNOT ladder + H / S H), the Clifford remainder is synthesised with Qiskit. Only the T-count is
+  optimal; the Clifford gates are not minimised.
