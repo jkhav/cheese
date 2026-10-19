@@ -1,4 +1,7 @@
-# cudasynth
+# cheese
+
+**C**lifford+T **H**ardware-accelerated **E**xact **E**numerative **S**ynthesis **E**ngine, a companion to
+[milq](https://github.com/QuantumFIT/milq). The binaries and Python package are still called `cudasynth`.
 
 Exact Clifford+T circuit synthesis by GPU branch-and-bound: enumerate gate sequences level by level, prune every
 prefix whose remaining work provably exceeds the depth budget, and either find a circuit or prove that none of
