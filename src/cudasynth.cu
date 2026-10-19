@@ -39,6 +39,12 @@
 #endif
 #define HD __host__ __device__
 
+#ifndef NQ_MIN
+#define NQ_MIN 1
+#endif
+#ifndef NQ_MAX
+#define NQ_MAX 4
+#endif
 constexpr int DMAX = 48;          // longest prefix
 constexpr int GMAX = 64;          // most candidates
 constexpr int LMAX = 8;           // largest local gate dimension (3-qubit gates)
@@ -580,11 +586,19 @@ int main(int argc, char **argv) {
   }
   if (depth > DMAX) { std::fprintf(stderr, "depth > %d\n", DMAX); return 3; }
   std::fprintf(stderr, "cudasynth: n %d, %d candidates, depth %d, dedupe %d\n", hs.n, hs.G, depth, dedupe);
-  switch (hs.n) {
+  switch (hs.n) {   // qubit counts compiled in: NQ_MIN..NQ_MAX (each one is a full instantiation; nvcc is slow)
+#if NQ_MIN <= 1 && NQ_MAX >= 1
     case 1: return run<1>(hs, depth, dedupe, chunk);
+#endif
+#if NQ_MIN <= 2 && NQ_MAX >= 2
     case 2: return run<2>(hs, depth, dedupe, chunk);
+#endif
+#if NQ_MIN <= 3 && NQ_MAX >= 3
     case 3: return run<3>(hs, depth, dedupe, chunk);
+#endif
+#if NQ_MIN <= 4 && NQ_MAX >= 4
     case 4: return run<4>(hs, depth, dedupe, chunk);
-    default: std::fprintf(stderr, "n = %d not built\n", hs.n); return 3;
+#endif
+    default: std::fprintf(stderr, "n = %d not built (NQ_MIN..NQ_MAX)\n", hs.n); return 3;
   }
 }
