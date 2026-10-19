@@ -10,6 +10,35 @@ measurement. See [docs/PLAN.md](docs/PLAN.md).
 
 Status: early development using AI agents. How the search and its pruning work: [docs/ALGORITHM.md](docs/ALGORITHM.md).
 
+## Notable results
+
+All proofs are exhaustive searches with sound lower bounds; every circuit is re-checked exactly. RTX 3060 Ti.
+Details: [benchmarks/README.md](benchmarks/README.md), [benchmarks/optimal/README.md](benchmarks/optimal/README.md),
+[docs/PLAN.md](docs/PLAN.md).
+
+**Optimal gate counts, proved** (every smaller budget impossible; global phase included):
+
+| target | input gates | proved optimum | time |
+|---|---|---|---|
+| Toffoli | 15 | **15** (every circuit of <= 14 gates ruled out) | 27 s with `--table 8` |
+| Fredkin | 17 | **17** (<= 16 ruled out) | ~100 s |
+| RUS 1 / 3 / 4 / 5 / 6 | 13 / 12 / 20 / 37 / 33 | **11 / 11 / 18 / 29 / 28** | 4-21 s |
+| RUS 7 / 13 / 14 / 27 (3 qubits) | 9 / 18 / 14 / 20 | **7 / 16 / 12 / 14** | 12-269 s |
+| RUS 2, 8, 12, 20, 28 | 7, 11, 8, 9, 3 | same as input: input proved optimal | 2-13 s |
+
+For context: milq's SAT runs proved Toffoli impossible up to 8 gates, its Python branch-and-bound prototype up to
+10 (Fredkin 9); this search reaches 14 (Fredkin 16). RUS circuits are taken as their full unitary (measurement dropped), so a circuit that is only right
+on the success branch can be shorter.
+
+**Optimal T-counts, proved** (up to global phase):
+- RUS 7: 14 -> **4** (two Toffolis replaced), RUS 13: 14 -> **8**, RUS 14: 12 -> **6** (ccx counted as 7 T).
+- RUS 8: T-count 4, listed as best known in its source paper, is now proved optimal.
+- Every other RUS instance: the benchmark circuit's T-count proved optimal.
+- Toffoli, Fredkin, Peres, CCZ 7 (the known optimum, as a check), relative-phase Toffoli 4, CS 3, QFT_2 3,
+  about 1 s each once the coset table is built (41 s, cached).
+
+**Speed:** Toffoli 11 proved impossible in 0.5 s on the GPU (2.3 min on the CPU build), Toffoli 12 in 7.9 s.
+
 ## Install and build
 
     ./install.sh              # checks the NVIDIA driver, finds nvcc (or installs NVIDIA's CUDA compiler wheels into
@@ -44,3 +73,8 @@ Toffoli 7/8/9, CCZ 8. CPU build on a 12-thread laptop: Toffoli 9 in 7.9 s, CCZ 8
 Toffoli, Fredkin, Peres, CCZ (T-count 7) take about 1 s each on an RTX 3060 Ti once the 3-qubit coset table
 (41 s, cached in build/) exists. Method in [docs/ALGORITHM.md](docs/ALGORITHM.md) section 10, results in
 docs/PLAN.md and benchmarks/README.md.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Benchmark circuits in `benchmarks/` come from milq and the sources named in
+their READMEs (MQT Bench, published RUS papers).
