@@ -316,8 +316,51 @@ between targets), the table is built once per qubit count and reused by every ta
 ## 11. What is checked
 
 - `tests/check.sh`: known verdicts (proofs and found optima) with exact verification of every circuit.
+- `tests/rus_check.sh`: RUS mode optima across table depths (every found circuit verified exactly).
 - Every new pruning rule was checked against a run without it: identical verdicts and optimal lengths, and
   for rules that should not change the frontier (T-bound rewrite, tree layout, `--no-sym`) identical per-level
   counts on all test, bench and RUS instances.
 - Every reported circuit is multiplied out exactly (in the binary for table and meet-in-the-middle results,
   and again by `cheese.verify`).
+
+## 12. RUS mode (`rus.sh`, `src/rus.cu`; separate binary)
+
+T-count of a two-qubit repeat-until-success circuit **with its measurement**: the fewest T gates over all
+Clifford+T circuits W (q0 ancilla prepared in |0> and measured, q1 data) whose success branch is the target's
+(same success unitary up to Cliffords on either side, same Pr[success]) and whose failure branch is a Clifford.
+T-count mode (section 10) bounds the whole unitary instead, which only gives an upper bound here: the other half of
+W (ancilla input |1>) and the Cliffords applied after the measurement are free.
+
+- Only J = W(|0> x I) (a 4 x 2 isometry) matters. Write W = C X_t ... X_1 with C a Clifford on the output side;
+  J is a valid RUS isometry iff C^-1 J is one of finitely many **roots** up to left Cliffords. Roots
+  (`python -m cheese.rus spec`): the success outcome moved to 0, failure block gamma D with D one of the 24
+  one-qubit Cliffords and gamma in D[w] with |gamma|^2 = 1 - p, success block u M with M the target's block and
+  |u| = 1, u M exact (u = h / m for an entry m of M and |h| = |m|). Both norm equations are solved exactly by
+  enumerating Z[w] elements whose coefficients' squares sum to the rational part. Typically 12 roots.
+- Representation: J's Pauli transfer matrix Jc[a][b] = Tr(P_a J P_b J^dag) / 2, 16 x 4 (rows two-qubit Paulis,
+  columns one-qubit Paulis), entries (x + y sqrt2) / sqrt2^e. A rotation R(P)^-1 on the left mixes rows exactly
+  as in section 10; a left Clifford permutes rows with signs. The search works on **left** cosets C J (the
+  quotient and the peels are on the same side): the successors of a coset are still well defined, since
+  R(P)^-1 C J = C R(+-P')^-1 J and R(-P')^-1 J lies in the coset of R(P')^-1 J (they differ by S_P' on the left).
+- Coset key: exponent, row 0 (the identity row, fixed by every Clifford) and the sum of hashes of the
+  sign-normalised rows: Clifford-invariant, so no coset is missed. Coset equality is exact: equal row multisets
+  are **not** enough (an isometry's PTM has zero and repeated rows; such collisions do occur: the GPU table keeps
+  692 cosets at level 4 where exact merging gives 683), so the Clifford is found explicitly. It is fixed by the
+  images of X_0, Z_0, X_1, Z_1; candidates are the rows equal (up to sign) to the target's generator rows,
+  filtered by their commutation pattern, looked up in a 2^20 table indexed by the four images, and confirmed on
+  all 16 rows. In the Python prototype this is 182 us per check against 6.4 ms for trying all 11520 Cliffords.
+- Table: cosets reachable from J00 = |0> x I with <= K peels (default K = 8: 5.7M cosets, 1.7 s, cached in
+  `build/rus-table-k<K>.bin`; growth about 9x per level). Search: peel the roots level by level (about 10x per
+  level); a hit at level j against table level c gives W = R(P_1)..R(P_j) C R(Q_c)^-1..R(Q_1)^-1 with j + c
+  T gates, and the first level with a hit is optimal (as in section 10). `rus.sh` searches below the input's own
+  T-count by default, so "none found" proves the input optimal.
+- Check (`python -m cheese.rus verify`): the circuit is built (rotations as in section 10, the Clifford from its
+  generator word) and its blocks are checked exactly: outcome-0 block S with S M^dag = mu I and |mu| = p, i.e.
+  S = (unit) M, and outcome-1 block B with B B^dag = q I and B P B^dag proportional to a Pauli.
+
+Representations compared before the GPU version (Python prototype, per node): PTM peel 2.2 us and key 4.2 us;
+canonical PTM (minimum over all Cliffords) 18 ms; the isometry itself over Z[w] (statevector style) has no cheap
+invariant key, and its canonical form over 11520 Cliffords x 8 phases costs 1.8 s per node.
+
+Results agree across table depths (K = 4, 5, 7, 8 and with K = 1, where the search side does the work) and with
+the prototype (forward search without a table). RUS T-count 15 targets: about 6 s on an RTX 3060 Ti.

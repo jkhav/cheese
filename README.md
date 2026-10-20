@@ -90,6 +90,18 @@ replaces every Clifford segment between T gates by an optimal one from a GPU tab
 (up to 3 qubits) and beam-searches where the T gates sit to make the total small. Every result is checked
 exactly. Method: [docs/ALGORITHM.md](docs/ALGORITHM.md) section 10.
 
+## RUS mode
+
+    ./build.sh rus                      # build/rus (src/rus.cu)
+    ./rus.sh TARGET.qasm [--opt]        # two qubits: q0 ancilla (measured), q1 data
+
+Optimal T-count of a repeat-until-success circuit with the measurement taken into account: the fewest T gates
+for the same success branch (success unitary up to Cliffords, same success probability) with a Clifford failure
+branch. T-count mode on the same circuit counts the whole unitary, an upper bound. By default the search runs
+below the input's T-count, so no hit proves the input optimal; a found circuit is checked exactly and written to
+results/<name>-rus.qasm (`--opt`: Clifford gates minimised as in Clifford mode). Method:
+[docs/ALGORITHM.md](docs/ALGORITHM.md) section 12.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Benchmark circuits in `benchmarks/` come from milq and the sources named in
