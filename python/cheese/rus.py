@@ -227,17 +227,28 @@ def roots(W, ks):
         u = qmul(qmul([Fraction(v) for v in h], [Fraction(v) for v in conjz(m0)]), inv)
         if all(c.denominator & (c.denominator - 1) == 0 for r in M for z in r for c in qmul(u, [Fraction(v) for v in z])):
             us.append(u)
-    D1, seen, fr = [], set(), [identity(2)]                # the 24 one-qubit Cliffords mod phase
+    # Redundant combinations skipped: (u, gamma) and (w u, w gamma) give the same J up to global phase, so one gamma
+    # per orbit {w^k gamma}; D and Q D (Q a Pauli) differ by a controlled-Pauli after the circuit, a free Clifford,
+    # so one D per coset of the Pauli group (6 of the 24).
+    gammas = list({min(mul(wpow(k), g) for k in range(8)): g for g in gammas}.values())
+    paulis = [pauli_matrix(1, q) for q in range(4)]
+    D1, seen, fr = [], set(), [identity(2)]                # one-qubit Cliffords mod phase and left Paulis
+    allD = set()
     while fr:
         nx = []
         for U in fr:
             key = min(tuple(mul(wpow(ph), x) for r in U[1] for x in r) for ph in range(8)) + (U[0],)
-            if key not in seen:
-                seen.add(key)
+            if key in allD:
+                continue
+            allD.add(key)
+            nx += [matmul(gate_matrix(g, (0,), 1), U) for g in ("h", "s")]
+            coset = min(min(tuple(mul(wpow(ph), x) for r in QU[1] for x in r) for ph in range(8)) + (QU[0],)
+                        for QU in (matmul(Q, U) for Q in paulis))
+            if coset not in seen:
+                seen.add(coset)
                 D1.append(U)
-                nx += [matmul(gate_matrix(g, (0,), 1), U) for g in ("h", "s")]
         fr = nx
-    assert len(D1) == 24
+    assert len(allD) == 24 and len(D1) == 6
     found, out = {}, []
     for u in us:
         for g in gammas:
@@ -297,7 +308,8 @@ def circuit(res):
     gates = []
     for q in res["tb"]:
         gates += rotation(2, q, True)
-    gates += [CGEN[gi] for gi in cliffords()[res["cliff"]][2]]
+    for gi in cliffords()[res["cliff"]][2]:                 # cz as h cx h (cliffopt has no cz)
+        gates += [("h", (1,)), ("cx", (0, 1)), ("h", (1,))] if CGEN[gi][0] == "cz" else [CGEN[gi]]
     for p in reversed(res["fw"]):
         gates += rotation(2, p, False)
     return gates
