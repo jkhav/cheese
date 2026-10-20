@@ -13,6 +13,7 @@ rescaling u of the success block, a failure amplitude gamma with |gamma|^2 = 1 -
 
   python -m cheese.rus spec TARGET.qasm [--outcome K] > target.rspec
   python -m cheese.rus verify TARGET.qasm OUTPUT OUT.qasm [--outcome K] [--opt [BEAM]]   (OUTPUT: build/rus stdout)
+  python -m cheese.rus opt TARGET.qasm OUT.qasm [--outcome K]   (TARGET's Clifford gates minimised, same unitary)
 
 Without --outcome the success outcome is read from a "success outcome K" comment, else detected (the outcome
 whose branch is not proportional to a Clifford).
@@ -315,19 +316,19 @@ def circuit(res):
     return gates
 
 
-def check_rus(W, ks, V):
-    """exact: V's outcome-0 branch = (unit) x W's outcome-ks branch and V's outcome-1 branch is proportional to a
+def check_rus(W, ks, V, kv=0):
+    """exact: V's outcome-kv branch = (unit) x W's outcome-ks branch and V's other branch is proportional to a
     Clifford (so V is a RUS circuit with the same success unitary and probability)"""
     kW, BW = blocks(W)
     kV, BV = blocks(V)
     M = (kW, tuple(tuple(r) for r in BW[ks]))
-    S = (kV, tuple(tuple(r) for r in BV[0]))
+    S = (kV, tuple(tuple(r) for r in BV[kv]))
     pM = scalar(matmul(M, adj(M)))                         # M M^dag = p I
     mu = scalar(matmul(S, adj(M)))                         # S M^dag = mu I, so S = (mu / p) M
     if pM is None or mu is None:
         return False
     sq = lambda s, z: normalise(2 * s[0], ((mul(s[1][0][0], z),),))
-    return sq(mu, conjz(mu[1][0][0])) == sq(pM, pM[1][0][0]) and clifford_block(kV, BV[1])   # |mu| = p
+    return sq(mu, conjz(mu[1][0][0])) == sq(pM, pM[1][0][0]) and clifford_block(kV, BV[1 - kv])   # |mu| = p
 
 
 def main():
@@ -340,6 +341,29 @@ def main():
         R, info = roots(W, ks)
         print(json.dumps(dict(outcome=ks, roots=len(R), **info)), file=sys.stderr)
         write_spec(sys.stdout, R)
+    elif len(args) >= 3 and args[0] == "opt":
+        # the input circuit with its Clifford gates minimised (for an input whose T-count is already RUS-optimal):
+        # cliffopt keeps the unitary up to phase, so the RUS behaviour is unchanged; checked exactly anyway
+        from .tcircuit import optimise
+        n, circ = parse_qasm(args[1])
+        W = unitary(n, circ)
+        ks = int(args[args.index("--outcome") + 1]) if "--outcome" in args else success_outcome(args[1], W)
+        gates = []
+        for g, qs in circ:                                 # cz as h cx h (cliffopt has no cz)
+            gates += [("h", (qs[1],)), ("cx", qs), ("h", (qs[1],))] if g == "cz" else [(g, qs)]
+        gates, info = optimise(2, gates)
+        tc = sum(g in ("t", "tdg") for g, _ in gates)
+        ok = check_rus(W, ks, unitary(2, gates), ks) and tc == sum(g in ("t", "tdg") for g, _ in circ)
+        print(f"{'verified' if ok else 'NOT VERIFIED'}: {len(circ)} -> {len(gates)} gates, T-count {tc}; same RUS "
+              f"behaviour (success outcome {ks}): {ok}")
+        if not ok:
+            sys.exit(1)
+        with open(args[2], "w") as f:
+            f.write(f"OPENQASM 2.0;\ninclude \"qelib1.inc\";\n// T-count {tc} (RUS-optimal), {len(gates)} gates; Clifford "
+                    f"gates minimised, same unitary up to phase; success outcome {ks}\n")
+            f.write("qreg q[2];\ncreg c[1];\n")
+            f.write("".join(f"{g} " + ",".join(f"q[{q}]" for q in qs) + ";\n" for g, qs in gates))
+            f.write("measure q[0] -> c[0];\n")
     elif len(args) >= 4 and args[0] == "verify":
         n, circ = parse_qasm(args[1])
         W = unitary(n, circ)
